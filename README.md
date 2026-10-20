@@ -533,7 +533,7 @@ It is **off by default** and fail-closed. Settings under `wake` in `config.json`
 | `wake.allowCwds` | `[]` | Absolute directories whose sessions may be woken. Empty allows none. |
 | `wake.confirm` | `"always"` | `"always"` asks the user before every wake and blocks when there is no UI. `"never"` skips the dialog for allowlisted directories. |
 | `wake.provider` | `"pi-web-sessiond"` | Registered provider id. |
-| `wake.sessiondSocket` / `wake.sessiondUrl` | — | Endpoint of the PI WEB session daemon. Otherwise `PI_WEB_SESSIOND_SOCKET` / `PI_WEB_SESSIOND_URL` is used. The endpoint is never guessed. |
+| `wake.sessiondSocket` / `wake.sessiondUrl` | — | Endpoint of the PI WEB session daemon. Otherwise `PI_WEB_SESSIOND_SOCKET` / `PI_WEB_SESSIOND_URL` is used. The endpoint is never guessed. A daemon started with its default socket does not export it to its sessions, so set `wake.sessiondSocket` (usually `~/.pi-web/sessiond.sock`, as an absolute path). |
 | `wake.dedupMs` | 600000 | An identical message to the same session inside this window is refused. |
 | `wake.perTargetMax` / `wake.perTargetWindowMs` | 3 / 600000 | Wakes allowed per session per window. |
 | `wake.globalMax` / `wake.globalWindowMs` | 10 / 3600000 | Wakes allowed in total per window, across all sessions of the user. |
