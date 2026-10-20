@@ -5,6 +5,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 ## [Unreleased]
 
 ### Added
+- Sessions now report their real Pi session id as `piSessionId` in the roster, and the broker advertises the additive `pi-session-id-v1` feature. The intercom `id` can be a pinned stable id or a claimed alias, so it does not always identify the Pi session behind it. Older clients and brokers keep working unchanged: the field is optional, validated (non-empty string, at most 256 characters) and absent for clients that never send it.
 - In fullscreen mode, clicking an intercom message expands or collapses just that message. Ctrl+O still expands or collapses all of them at once. Thanks to [@summer-tt](https://github.com/summer-tt) for #178.
 
 ### Fixed

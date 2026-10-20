@@ -995,6 +995,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const herdrSessionPath = herdrPaneId ? liveContext.sessionManager.getSessionFile() : undefined;
     return {
       ...identity,
+      // The intercom id may be a pinned stable id or a claimed alias; peers need the real Pi session id to resolve this session.
+      piSessionId: currentSessionId,
       cwd: liveContext.cwd,
       model: currentModel,
       pid: process.pid,

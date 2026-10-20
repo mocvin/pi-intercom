@@ -1,3 +1,4 @@
+import { MAX_PI_SESSION_ID_LENGTH } from "../types.ts";
 import type {
   Attachment,
   Message,
@@ -11,6 +12,12 @@ import type {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Optional Pi session id field: absent, or a non-empty string within the length bound. */
+function isOptionalPiSessionId(value: unknown): boolean {
+  return value === undefined
+    || (typeof value === "string" && value.trim().length > 0 && value.length <= MAX_PI_SESSION_ID_LENGTH);
 }
 
 function isHerdrLocation(value: unknown): boolean {
@@ -203,6 +210,10 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
     return false;
   }
 
+  if (!isOptionalPiSessionId(value.piSessionId)) {
+    return false;
+  }
+
   if (value.status !== undefined && typeof value.status !== "string") {
     return false;
   }
@@ -253,6 +264,9 @@ export function isSessionRegistration(value: unknown): value is SessionRegistrat
     return false;
   }
   if (value.runtimeFallbackAlias !== undefined && typeof value.runtimeFallbackAlias !== "boolean") {
+    return false;
+  }
+  if (!isOptionalPiSessionId(value.piSessionId)) {
     return false;
   }
   if (value.extensions !== undefined && !Array.isArray(value.extensions)) {

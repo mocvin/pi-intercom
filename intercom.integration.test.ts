@@ -416,7 +416,7 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
     assert.deepEqual(registerMessages, [{
       type: "registered",
       sessionId: "authorized-tcp-client",
-      features: ["extension-bus-v1", "exact-send-v1"],
+      features: ["extension-bus-v1", "exact-send-v1", "pi-session-id-v1"],
     }]);
   } finally {
     if (broker.exitCode === null && broker.signalCode === null) {
@@ -1869,6 +1869,112 @@ test("extension can pin a restart-stable intercom session id", { concurrency: fa
     const session = await waitForSessionId(planner, "pinned-worker-session");
     assert.equal(session.name, "pinned-worker");
     assert.equal(process.env.PI_INTERCOM_SESSION_ID, "pinned-worker-session");
+    await harness.emitLifecycle("session_shutdown");
+  } finally {
+    if (previousStableId === undefined) delete process.env.PI_INTERCOM_STABLE_ID;
+    else process.env.PI_INTERCOM_STABLE_ID = previousStableId;
+    if (previousPublishedId === undefined) delete process.env.PI_INTERCOM_SESSION_ID;
+    else process.env.PI_INTERCOM_SESSION_ID = previousPublishedId;
+    await cleanup();
+  }
+});
+
+test("broker reports the real Pi session id in the roster and advertises pi-session-id-v1", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const withPiId = new IntercomClient();
+  try {
+    assert.equal(planner.supportsFeature("pi-session-id-v1"), true);
+    await withPiId.connect({
+      name: "pi-id-worker",
+      piSessionId: "0198a0a0-1111-7222-8333-444455556666",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    }, "pi-id-worker-intercom-id");
+    const sessions = await planner.listSessions();
+    const worker = sessions.find((session) => session.id === "pi-id-worker-intercom-id");
+    assert.equal(worker?.piSessionId, "0198a0a0-1111-7222-8333-444455556666", "the intercom id and the Pi session id are distinct");
+    // A registrant that never reports one (an older client or a non-Pi client) keeps an unchanged roster entry.
+    const legacy = sessions.find((session) => session.id === planner.sessionId);
+    assert.ok(legacy);
+    assert.equal("piSessionId" in legacy, false);
+  } finally {
+    await withPiId.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("broker refuses a malformed or oversized Pi session id at registration", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const net = await import("node:net");
+  const { getBrokerSocketPath } = await import("./broker/paths.ts");
+  const { writeMessage } = await import("./broker/framing.ts");
+  try {
+    for (const [index, piSessionId] of [123, "", "   ", "x".repeat(257), null, { id: "nested" }].entries()) {
+      const socket = net.connect(getBrokerSocketPath());
+      await once(socket, "connect");
+      const closed = once(socket, "close");
+      socket.on("error", () => undefined);
+      writeMessage(socket, {
+        type: "register",
+        sessionId: `bad-pi-session-id-${index}`,
+        session: { name: `bad-pi-session-id-${index}`, piSessionId, cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() },
+      });
+      await closed;
+    }
+    const sessions = await planner.listSessions();
+    assert.deepEqual(sessions.filter((session) => session.id.startsWith("bad-pi-session-id-")), []);
+    // The bound is inclusive and does not affect ordinary registrations.
+    const edge = new IntercomClient();
+    try {
+      await edge.connect({ name: "edge-pi-session-id", piSessionId: "y".repeat(256), cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() });
+      assert.equal((await planner.listSessions()).some((session) => session.piSessionId === "y".repeat(256)), true);
+    } finally {
+      await edge.disconnect().catch(() => undefined);
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
+test("extension registers the real Pi session id next to a pinned stable intercom id", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const previousStableId = process.env.PI_INTERCOM_STABLE_ID;
+  const previousPublishedId = process.env.PI_INTERCOM_SESSION_ID;
+  process.env.PI_INTERCOM_STABLE_ID = "pinned-pi-id-session";
+  const harness = createExtensionHarness("pinned-pi-id-worker", { sessionId: "real-pi-session-id" });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const session = await waitForSessionId(planner, "pinned-pi-id-session");
+    assert.equal(session.piSessionId, "real-pi-session-id", "addressable by the stable id, resolvable by the Pi session id");
+    await harness.emitLifecycle("session_shutdown");
+  } finally {
+    if (previousStableId === undefined) delete process.env.PI_INTERCOM_STABLE_ID;
+    else process.env.PI_INTERCOM_STABLE_ID = previousStableId;
+    if (previousPublishedId === undefined) delete process.env.PI_INTERCOM_SESSION_ID;
+    else process.env.PI_INTERCOM_SESSION_ID = previousPublishedId;
+    await cleanup();
+  }
+});
+
+test("extension reports the Pi session id when the intercom id is the Pi session id", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const previousStableId = process.env.PI_INTERCOM_STABLE_ID;
+  const previousPublishedId = process.env.PI_INTERCOM_SESSION_ID;
+  delete process.env.PI_INTERCOM_STABLE_ID;
+  const harness = createExtensionHarness("plain-pi-id-worker", { sessionId: "plain-pi-session-id" });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const session = await waitForSessionId(planner, "plain-pi-session-id");
+    assert.equal(session.piSessionId, "plain-pi-session-id");
     await harness.emitLifecycle("session_shutdown");
   } finally {
     if (previousStableId === undefined) delete process.env.PI_INTERCOM_STABLE_ID;

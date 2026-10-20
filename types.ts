@@ -1,5 +1,9 @@
 export const EXTENSION_BUS_FEATURE = "extension-bus-v1";
 export const EXACT_SEND_FEATURE = "exact-send-v1";
+/** The broker records and reports a registrant's real Pi session id (`SessionInfo.piSessionId`). */
+export const PI_SESSION_ID_FEATURE = "pi-session-id-v1";
+/** Upper bound for a self-asserted Pi session id; real ids are UUIDs. */
+export const MAX_PI_SESSION_ID_LENGTH = 256;
 /** Broker refused a register because another live process holds the session id. */
 export const SESSION_HELD_ERROR_CODE = "E_SESSION_HELD";
 
@@ -36,6 +40,13 @@ export interface SessionInfo {
   name?: string;
   /** True only when the extension synthesized name for an unnamed runtime. */
   runtimeFallbackAlias?: boolean;
+  /**
+   * The real Pi session id (`sessionManager.getSessionId()`) behind this live endpoint.
+   * `id` is the intercom address and may be a pinned stable id or a claimed alias, so it
+   * is not always the Pi session id. Self-asserted by the registrant, like `cwd` and `pid`;
+   * absent for clients that predate `pi-session-id-v1` and for non-Pi clients.
+   */
+  piSessionId?: string;
   cwd: string;
   model: string;
   pid: number;
