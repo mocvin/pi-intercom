@@ -518,7 +518,7 @@ If the host refuses the wake (not found, archived, rejected), the held message i
 
 ### Installing this fork
 
-This feature ships in a fork of pi-intercom published as the package **`pi-intercom-wake`** ([mocvin/pi-intercom](https://github.com/mocvin/pi-intercom), branch `wake-v1`). It is a **drop-in replacement**, not an add-on: it registers the same `intercom` tool and commands and uses the same broker and `~/.pi/agent/intercom` directory, so it must not be installed next to `npm:pi-intercom`. Remove the original first:
+This feature ships in a fork of pi-intercom published as the package **`pi-intercom-wake`** ([mocvin/pi-intercom](https://github.com/mocvin/pi-intercom)). It is a **drop-in replacement**, not an add-on: it registers the same `intercom` tool and commands and uses the same broker and `~/.pi/agent/intercom` directory, so it must not be installed next to `npm:pi-intercom`. Remove the original first:
 
 ```sh
 pi remove npm:pi-intercom
