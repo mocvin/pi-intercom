@@ -88,13 +88,13 @@ test("an unreachable or unconfigured daemon is a definitive 'unavailable' and no
   }
 });
 
-test("wake posts the internal command to the session's prompt route with followUp and the exact cwd", async () => {
-  await withDaemon((_r, _b, res) => json(res, 200, { accepted: true }), async (socketPath, requests) => {
+test("wake runs the internal command through the session's commands route with the exact cwd", async () => {
+  await withDaemon((_r, _b, res) => json(res, 200, { type: "done" }), async (socketPath, requests) => {
     await createSessiondProvider({ sessiondSocket: socketPath }).wake({ piSessionId: "0198/odd id", cwd: "/repo" }, "msg-1");
     assert.equal(requests.length, 1);
     assert.equal(requests[0]!.method, "POST");
-    assert.equal(requests[0]!.url, "/sessions/0198%2Fodd%20id/prompt");
-    assert.deepEqual(JSON.parse(requests[0]!.body), { cwd: "/repo", text: "/intercom-wake msg-1", streamingBehavior: "followUp" });
+    assert.equal(requests[0]!.url, "/sessions/0198%2Fodd%20id/commands/run");
+    assert.deepEqual(JSON.parse(requests[0]!.body), { cwd: "/repo", text: "/intercom-wake msg-1" });
   });
 });
 
@@ -106,7 +106,9 @@ test("wake maps the daemon's answers: refusals are definitive, unknown outcomes 
     [(_r, _b, res) => json(res, 400, { error: "Archived sessions are read-only. Restore the session to continue." }), "archived", true],
     [(_r, _b, res) => json(res, 400, { error: "cwd field must be a string" }), "rejected", true],
     [(_r, _b, res) => json(res, 500, { error: "boom" }), "server_error", false],
-    [(_r, _b, res) => json(res, 200, { accepted: false }), "unsupported", true],
+    [(_r, _b, res) => json(res, 200, { type: "unsupported", message: "Unknown command: /intercom-wake" }), "rejected", true],
+    [(_r, _b, res) => json(res, 200, { accepted: true }), "unsupported", true],
+    [(_r, _b, res) => json(res, 200, { type: "select" }), "unsupported", true],
     [(_r, _b, res) => json(res, 200, {}), "unsupported", true],
   ];
   for (const [handler, code, definitive] of cases) {
@@ -121,7 +123,7 @@ test("a wake whose answer never arrives is an uncertain timeout, not a definitiv
 });
 
 test("a message id that cannot be carried safely in a command is refused before anything is sent", async () => {
-  await withDaemon((_r, _b, res) => json(res, 200, { accepted: true }), async (socketPath, requests) => {
+  await withDaemon((_r, _b, res) => json(res, 200, { type: "done" }), async (socketPath, requests) => {
     for (const bad of ["", "a b", "x\n/other", "a;b", "$(id)", "x".repeat(200)]) {
       await expectWakeError(createSessiondProvider({ sessiondSocket: socketPath }).wake({ piSessionId: "p", cwd: "/repo" }, bad), "rejected", true);
     }

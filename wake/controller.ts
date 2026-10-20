@@ -132,7 +132,7 @@ export async function performWake(deps: WakeDeps, request: WakeRequest): Promise
     try {
       approved = await deps.confirm!(
         "Wake a persisted session?",
-        `This loads the saved session${name ? ` "${name}"` : ""} (${target.piSessionId}) in ${cwd} and delivers this message to it. The session runs its extensions and then answers the message with its model.\n\n${preview}`,
+        `This loads the saved session${name ? ` "${name}"` : ""} (${target.piSessionId}) in ${cwd} and delivers this message to it. The session runs its extensions and then answers the message with its model. If the session is already open in PI WEB with questions waiting for the user (ask_user), those questions are closed as unanswered.\n\n${preview}`,
       );
     } catch {
       approved = false;

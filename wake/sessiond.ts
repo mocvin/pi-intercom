@@ -6,9 +6,13 @@ import { SAFE_MESSAGE_ID, WAKE_COMMAND_PROMPT, WakeError, type WakeCandidate, ty
 /**
  * Wake provider for the PI WEB session daemon.
  *
- * EXPERIMENTAL: it uses two internal, unsupported routes of the daemon,
+ * EXPERIMENTAL: it uses internal, unsupported routes of the daemon,
+ *   GET  /health                               identifies the daemon
  *   GET  /sessions?cwd=<absolute cwd>          read-only catalog of persisted sessions
- *   POST /sessions/:sessionId/prompt           opens a saved session and admits a prompt
+ *   POST /sessions/:sessionId/commands/run     opens a saved session and runs one REGISTERED command
+ * commands/run is used instead of /prompt because it refuses a command the session does not have (an intercom
+ * that is missing or too old), so "/intercom-wake ..." can never reach a model as text, and it does not echo the
+ * command in the PI WEB transcript. Verified on an isolated daemon (scripts/e2e/busy-e2e.ts).
  * They can change in any PI WEB release. Every unexpected answer becomes a WakeError (fail closed).
  * Do not call any other session route to "check" a session: status, messages, and snapshots open it too.
  * The endpoint is never guessed: it comes from configuration or PI_WEB_SESSIOND_SOCKET / PI_WEB_SESSIOND_URL.
@@ -137,19 +141,25 @@ export function createSessiondProvider(options: { sessiondSocket?: string; sessi
       if (!SAFE_MESSAGE_ID.test(messageId)) throw new WakeError("rejected", "The message id cannot be carried in a wake command");
       const result = await request(
         "POST",
-        `/sessions/${encodeURIComponent(target.piSessionId)}/prompt`,
-        // followUp: if the session is somehow already running, the command queues instead of failing.
-        { cwd: target.cwd, text: WAKE_COMMAND_PROMPT(messageId), streamingBehavior: "followUp" },
+        `/sessions/${encodeURIComponent(target.piSessionId)}/commands/run`,
+        // A busy session runs the command at once (streaming) or right after compaction; no model call either way.
+        { cwd: target.cwd, text: WAKE_COMMAND_PROMPT(messageId) },
         30_000, // backstop: the caller bounds the call with its own signal
         signal,
         true,
       );
-      if (result.status === 200 && (result.json as { accepted?: unknown } | undefined)?.accepted === true) return;
+      const answer = result.json as { type?: unknown; message?: unknown } | undefined;
+      if (result.status === 200 && answer?.type === "done") return;
+      if (result.status === 200 && answer?.type === "unsupported") {
+        const why = typeof answer.message === "string" ? answer.message.slice(0, 200) : "unsupported";
+        throw new WakeError("rejected", `The session cannot run /intercom-wake (${why}); its intercom extension is missing or too old, so nothing was sent to it`);
+      }
       const message = errorText(result.json);
       if (result.status === 404 || /session not found/i.test(message)) throw new WakeError("not_found", "The session daemon has no such session in that directory");
       if (/archived/i.test(message)) throw new WakeError("archived", "The session is archived and read-only");
       if (result.status >= 500) throw new WakeError("server_error", `The session daemon failed while handling the wake (HTTP ${result.status})`);
       if (result.status === 200) throw new WakeError("unsupported", "Unexpected wake answer from the session daemon");
+      // (an "accepted" answer would come from the /prompt route, which this provider no longer uses)
       throw new WakeError("rejected", `The session daemon refused the wake (HTTP ${result.status}${message ? `: ${message}` : ""})`);
     },
   };
