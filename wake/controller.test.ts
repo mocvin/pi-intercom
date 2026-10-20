@@ -22,7 +22,7 @@ function setup(over: { config?: Partial<WakeConfig>; features?: string[]; candid
     sessionId: "sender-intercom-id",
     supportsFeature: (feature) => (over.features ?? ["wake-v1"]).includes(feature),
     listSessions: async () => [],
-    send: async (to, options) => { lastId = options.messageId!; calls.sent.push({ to, text: options.text, ...(options.wake ? { wake: options.wake } : {}) }); return (over.sendResult ?? ok)(options.messageId!); },
+    send: async (to, options) => { lastId = options.messageId!; calls.sent.push({ to, text: options.text, ...(options.wake ? { wake: options.wake } : {}) }); const result = over.sendResult ? over.sendResult(options.messageId!) : ok(options.messageId!); return result; },
     cancelMessage: async (id) => { calls.cancelled.push(id); return ok(id, { delivery: "socket_delivered", code: undefined }); },
     onMessageReceipt: (handler) => { handlers.add(handler); return () => handlers.delete(handler); },
   };
@@ -37,7 +37,7 @@ function setup(over: { config?: Partial<WakeConfig>; features?: string[]; candid
   const audit = new WakeAudit(join(dir, "wake-audit.jsonl"));
   const deps: WakeDeps = {
     client, config, provider, audit,
-    ...(over.confirm === false ? {} : { confirm: async (t: string, b: string) => { calls.confirms++; return (over.confirm ?? (async () => true))(t, b); } }),
+    ...(over.confirm === false ? {} : { confirm: async (t: string, b: string) => { calls.confirms++; const c = over.confirm; return c ? c(t, b) : true; } }),
     self: { intercomId: "sender-intercom-id", piSessionId: "sender-pi-id", cwd: "/elsewhere" },
   };
   return { deps, calls, audit, config, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
@@ -228,4 +228,35 @@ test("findLiveWakeTarget matches a connected session by Pi session id, intercom 
   assert.equal(findLiveWakeTarget(roster, "worker", "/repo")?.id, "stable-id");
   assert.equal(findLiveWakeTarget(roster, "pi-2", "/repo"), undefined, "same name or id in another directory is not the target");
   assert.equal(findLiveWakeTarget(roster, "nobody", "/repo"), undefined);
+});
+
+test("a sender the user trusted wakes without a dialog, even without a UI; every other check still applies", async () => {
+  const t = setup({ confirm: false });
+  try {
+    const trust = { find: (id: string) => (id === "sender-pi-id" ? { expiresAt: Date.now() + 60_000 } : undefined) };
+    const result = await performWake({ ...t.deps, trust }, request());
+    assert.deepEqual([result.ok, result.outcome], [true, "delivered"]);
+    assert.equal(t.calls.confirms, 0);
+    assert.equal(t.audit.read().find((e) => e.outcome === "delivered")?.confirmedBy, "trust");
+    const outside = await performWake({ ...t.deps, trust }, request({ cwd: "/not-allowed", message: "other" }));
+    assert.equal(outside.code, "cwd_not_allowed", "trust does not widen the allowlist");
+    const secret = await performWake({ ...t.deps, trust }, request({ message: `ghp_${"a".repeat(36)}` }));
+    assert.equal(secret.code, "possible_secret");
+    const duplicate = await performWake({ ...t.deps, trust }, request());
+    assert.equal(duplicate.code, "duplicate");
+  } finally { t.cleanup(); }
+});
+
+test("a grant for another session does not skip the dialog", async () => {
+  const t = setup();
+  try {
+    const trust = { find: (id: string) => (id === "someone-else" ? { expiresAt: Date.now() + 60_000 } : undefined) };
+    await performWake({ ...t.deps, trust }, request());
+    assert.equal(t.calls.confirms, 1);
+    assert.equal(t.audit.read().find((e) => e.outcome === "delivered")?.confirmedBy, "user");
+    const noUi = setup({ confirm: false });
+    try {
+      assert.equal((await performWake({ ...noUi.deps, trust }, request())).code, "confirmation_unavailable");
+    } finally { noUi.cleanup(); }
+  } finally { t.cleanup(); }
 });

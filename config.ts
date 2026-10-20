@@ -67,6 +67,8 @@ export interface WakeConfig {
   receiveTimeoutMs: number;
   auditMaxEntries: number;
   auditRetentionDays: number;
+  /** Lifetime of a /wake-trust grant, in days. */
+  trustDays: number;
   /** Explicit endpoint of the PI WEB session daemon; falls back to PI_WEB_SESSIOND_SOCKET / PI_WEB_SESSIOND_URL. Never guessed. */
   sessiondSocket?: string;
   sessiondUrl?: string;
@@ -123,6 +125,7 @@ export const defaultWakeConfig = (): WakeConfig => ({
   receiveTimeoutMs: 15_000,
   auditMaxEntries: 1000,
   auditRetentionDays: 30,
+  trustDays: 30,
 });
 
 function parseWakeConfig(value: unknown): WakeConfig {
@@ -141,7 +144,7 @@ function parseWakeConfig(value: unknown): WakeConfig {
       wake[key] = raw[key] as boolean;
     }
   };
-  const positive = (key: "dedupMs" | "perTargetMax" | "perTargetWindowMs" | "globalMax" | "globalWindowMs" | "listTimeoutMs" | "wakeTimeoutMs" | "deliveryTimeoutMs" | "receiveTimeoutMs" | "auditMaxEntries" | "auditRetentionDays") => {
+  const positive = (key: "dedupMs" | "perTargetMax" | "perTargetWindowMs" | "globalMax" | "globalWindowMs" | "listTimeoutMs" | "wakeTimeoutMs" | "deliveryTimeoutMs" | "receiveTimeoutMs" | "auditMaxEntries" | "auditRetentionDays" | "trustDays") => {
     if (Object.hasOwn(raw, key)) {
       const n = raw[key];
       if (typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0) throw new Error(`"wake.${key}" must be a positive integer`);
@@ -163,7 +166,7 @@ function parseWakeConfig(value: unknown): WakeConfig {
     if (raw.confirm !== "always" && raw.confirm !== "never") throw new Error(`"wake.confirm" must be "always" or "never"`);
     wake.confirm = raw.confirm;
   }
-  for (const key of ["dedupMs", "perTargetMax", "perTargetWindowMs", "globalMax", "globalWindowMs", "listTimeoutMs", "wakeTimeoutMs", "deliveryTimeoutMs", "receiveTimeoutMs", "auditMaxEntries", "auditRetentionDays"] as const) positive(key);
+  for (const key of ["dedupMs", "perTargetMax", "perTargetWindowMs", "globalMax", "globalWindowMs", "listTimeoutMs", "wakeTimeoutMs", "deliveryTimeoutMs", "receiveTimeoutMs", "auditMaxEntries", "auditRetentionDays", "trustDays"] as const) positive(key);
   for (const key of ["sessiondSocket", "sessiondUrl"] as const) {
     if (Object.hasOwn(raw, key)) {
       if (typeof raw[key] !== "string" || !(raw[key] as string).trim()) throw new Error(`"wake.${key}" must be a non-empty string`);

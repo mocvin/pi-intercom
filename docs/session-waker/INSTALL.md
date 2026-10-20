@@ -25,7 +25,8 @@ Do not run `npm test` directly from inside a Pi session: `PI_CODING_AGENT_DIR` w
    { "wake": { "enabled": true, "allowCwds": ["/abs/project/dir"], "confirm": "always", "sessiondSocket": "/home/<user>/.pi-web/sessiond.sock" } }
    ```
    A daemon started with its default socket does not export `PI_WEB_SESSIOND_SOCKET` to its sessions, so set `sessiondSocket` explicitly; without it the provider answers `unavailable`.
-5. Check: `/intercom-wake-status`, and `node_modules/.bin/tsx scripts/ops/probe-broker.ts` (features and roster size). For a first real wake of a session you choose: `node_modules/.bin/tsx scripts/ops/verify-wake.ts <piSessionId> <abs cwd>` (the script itself is the confirmation).
+5. Optional: in a session that should wake others without a dialog (for example a coordinator), run `/wake-trust on` and confirm. Revoke with `/wake-trust off` or `/wake-trust revoke <id>`.
+6. Check: `/intercom-wake-status`, and `node_modules/.bin/tsx scripts/ops/probe-broker.ts` (features and roster size). For a first real wake of a session you choose: `node_modules/.bin/tsx scripts/ops/verify-wake.ts <piSessionId> <abs cwd>` (the script itself is the confirmation).
 
 ## Roll back
 1. `wake.enabled: false` turns the feature off; the fork then behaves like upstream.
@@ -34,7 +35,7 @@ Do not run `npm test` directly from inside a Pi session: `PI_CODING_AGENT_DIR` w
 4. Woken sessions are ordinary sessions; rolling back does not change their files.
 
 ## Uninstall
-Roll back, then delete `wake-audit.jsonl` and the `wake` section of `intercom/config.json` if you want. There is no other persistent state.
+Roll back, then delete `wake-audit.jsonl`, `wake-trust.json` and the `wake` section of `intercom/config.json` if you want. There is no other persistent state.
 
 ## Diagnose
 - `/intercom-wake-status`: settings, broker support for `wake-v1`, recent attempts.

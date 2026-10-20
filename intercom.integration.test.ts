@@ -2302,12 +2302,15 @@ async function withWake<T>(overrides: Record<string, unknown>, fn: (ctl: {
   runWakeCommand: (messageId: string) => Promise<void>;
   tool: (params: Record<string, unknown>) => Promise<CapturedToolResult>;
   audit: () => Array<Record<string, unknown>>;
-}) => Promise<T>, options: { confirm?: boolean; senderHasUi?: boolean; withConfig?: boolean } = {}): Promise<T> {
+}) => Promise<T>, options: { confirm?: boolean | ((body: string) => boolean); senderHasUi?: boolean; withConfig?: boolean } = {}): Promise<T> {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { registerWakeProvider } = await import("./wake/provider.ts");
   const { wakeAuditPath } = await import("./wake/audit.ts");
+  const { wakeTrustPath } = await import("./wake/trust.ts");
   const { planner, cleanup } = await setupClients();
   rmSync(wakeAuditPath(), { force: true });
+  rmSync(wakeTrustPath(), { force: true });
+  const answer = (body: string) => (typeof options.confirm === "function" ? options.confirm(body) : options.confirm !== false);
   const wakeCalls: string[] = [];
   const confirmations: string[] = [];
   const notices: string[] = [];
@@ -2320,9 +2323,9 @@ async function withWake<T>(overrides: Record<string, unknown>, fn: (ctl: {
     const sender = createExtensionHarness("wake-sender", {
       hasUI: options.senderHasUi !== false,
       sessionId: "wake-sender-pi-id",
-      ui: { confirm: async (_title: string, body: string) => { confirmations.push(body); return options.confirm !== false; }, notify: (message: string) => { notices.push(message); } },
+      ui: { confirm: async (_title: string, body: string) => { confirmations.push(body); return answer(body); }, notify: (message: string) => { notices.push(message); } },
     });
-    const target = createExtensionHarness("wake-target", { hasUI: true, isIdle: () => true, sessionId: WAKE_TARGET_PI_ID, ui: { notify: (message: string) => { notices.push(message); } } });
+    const target = createExtensionHarness("wake-target", { hasUI: true, isIdle: () => true, sessionId: WAKE_TARGET_PI_ID, ui: { confirm: async (_title: string, body: string) => { confirmations.push(body); return answer(body); }, notify: (message: string) => { notices.push(message); } } });
     registerWakeProvider("fake-wake", () => ({
       id: "fake-wake",
       describe: () => "fake 1",
@@ -2505,6 +2508,59 @@ test("/intercom-wake-status reports the settings and the recent attempts without
     assert.match(status, /Broker supports wake-v1: yes/);
     assert.match(status, /delivered \(delivered\)/);
     assert.equal(status.includes("open branch"), false);
+  });
+});
+
+test("/wake-trust on, once the user confirms, lets this session wake without a dialog; off brings the dialog back", { concurrency: false }, async () => {
+  await withWake({ deliveryTimeoutMs: 300 }, async (ctl) => {
+    ctl.setProvider(async () => undefined); // accepted, but the target stays dormant so every send is a wake
+    await ctl.sender.commands.get("wake-trust")!("on", ctl.sender.ctx);
+    assert.equal(ctl.confirmations.length, 1);
+    assert.match(ctl.confirmations[0]!, /without a confirmation dialog/);
+    const first = await ctl.tool(wakeParams({ message: "Trusted wake one" }));
+    assert.notEqual(first.details?.error, true, first.content[0]?.text);
+    assert.equal(ctl.confirmations.length, 1, "no wake dialog for a trusted sender");
+    const audit = ctl.audit();
+    assert.ok(audit.some((entry) => entry.outcome === "trust_granted" && (entry.target as { piSessionId: string }).piSessionId === "wake-sender-pi-id"));
+    assert.equal(audit.find((entry) => entry.outcome === "accepted_unconfirmed")?.confirmedBy, "trust");
+    await ctl.sender.commands.get("wake-trust")!("off", ctl.sender.ctx);
+    assert.equal(ctl.confirmations.length, 2);
+    await ctl.tool(wakeParams({ message: "Untrusted wake two" }));
+    assert.equal(ctl.confirmations.length, 3, "the dialog is back");
+    assert.ok(ctl.audit().some((entry) => entry.outcome === "trust_revoked"));
+  });
+});
+
+test("/wake-trust grants nothing when the user declines or there is no UI", { concurrency: false }, async () => {
+  const { WakeTrustStore, wakeTrustPath } = await import("./wake/trust.ts");
+  await withWake({}, async (ctl) => {
+    await ctl.sender.commands.get("wake-trust")!("on", ctl.sender.ctx);
+    assert.equal(ctl.confirmations.length, 1);
+    assert.deepEqual(new WakeTrustStore(wakeTrustPath()).list(), []);
+    assert.ok(ctl.notices.some((notice) => /Not changed/.test(notice)));
+  }, { confirm: (body) => !/without a confirmation dialog/.test(body) });
+  await withWake({}, async (ctl) => {
+    await ctl.sender.commands.get("wake-trust")!("on", ctl.sender.ctx);
+    assert.equal(ctl.confirmations.length, 0);
+    assert.deepEqual(new WakeTrustStore(wakeTrustPath()).list(), []);
+  }, { senderHasUi: false });
+});
+
+test("/wake-trust list and revoke work from another session; a revoked sender is asked again", { concurrency: false }, async () => {
+  await withWake({ deliveryTimeoutMs: 300 }, async (ctl) => {
+    ctl.setProvider(async () => undefined);
+    await ctl.sender.commands.get("wake-trust")!("on", ctl.sender.ctx);
+    await ctl.openTarget();
+    await ctl.target.commands.get("wake-trust")!("list", ctl.target.ctx);
+    assert.ok(ctl.notices.some((notice) => notice.includes("wake-sender-pi-id")));
+    await ctl.target.commands.get("wake-trust")!("revoke wake-sender-pi-id", ctl.target.ctx);
+    const before = ctl.confirmations.length;
+    // The target is connected now, so use a session id the catalog knows but nobody runs.
+    ctl.setProvider(async () => undefined, [{ piSessionId: "0198c0c0-1111-7222-8333-000000000001", cwd: repoDir, name: "other-dormant", archived: false }]);
+    await ctl.tool(wakeParams({ to: "0198c0c0-1111-7222-8333-000000000001", message: "After revoke" }));
+    assert.equal(ctl.confirmations.length, before + 1, "asked again after revoke");
+    await ctl.target.commands.get("wake-trust")!("revoke", ctl.target.ctx);
+    assert.ok(ctl.notices.some((notice) => /Usage: \/wake-trust revoke/.test(notice)));
   });
 });
 

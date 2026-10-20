@@ -5,6 +5,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 ## [Unreleased]
 
 ### Fork
+- `0.17.1-wake.2`: `/wake-trust on | off | list | revoke <id>` lets the user allow a session to wake others without a confirmation dialog. The permission is tied to that session's Pi session id, expires after `wake.trustDays` (30), needs the user's confirmation to grant or revoke, and is recorded in the audit (`trust_granted`, `trust_revoked`, and `confirmedBy` on every wake). Every other check still applies.
 - Published as `pi-intercom-wake` (version `0.17.1-wake.1`), a drop-in replacement for `pi-intercom` with the wake feature: same tool, commands, broker and runtime directory, so install one or the other, never both.
 
 ### Added

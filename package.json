@@ -1,6 +1,6 @@
 {
   "name": "pi-intercom-wake",
-  "version": "0.17.1-wake.1",
+  "version": "0.17.1-wake.2",
   "description": "Fork of pi-intercom that can wake persisted Pi sessions (opt-in): queue a message once, reopen the original session, deliver it normally. Drop-in replacement: remove pi-intercom first.",
   "repository": { "type": "git", "url": "git+https://github.com/mocvin/pi-intercom.git" },
   "homepage": "https://github.com/mocvin/pi-intercom#readme",
@@ -34,7 +34,7 @@
     "skills/**/*"
   ],
   "scripts": {
-    "test": "tsx --test handover.test.ts herdr-location.test.ts cross-machine-envelope.test.ts cross-machine-discovery.test.ts cross-machine-transport.test.ts cross-machine-integration.test.ts cli.test.ts broker/cross-machine-provenance.test.ts broker/client.test.ts broker/client-liveness.test.ts broker/extension.test.ts broker/framing.test.ts broker/paths.test.ts broker/protocol.test.ts broker/runtime-claim.test.ts broker/spawn.test.ts config.test.ts cwd.test.ts format-context.test.ts project-agent.test.ts reply-tracker.test.ts wake/resolve.test.ts wake/policy.test.ts wake/audit.test.ts wake/sessiond.test.ts wake/controller.test.ts intercom.integration.test.ts human-priority.pi.test.ts test/inline-message.test.ts test/overlay-width.test.ts test/handover-picker.test.ts"
+    "test": "tsx --test handover.test.ts herdr-location.test.ts cross-machine-envelope.test.ts cross-machine-discovery.test.ts cross-machine-transport.test.ts cross-machine-integration.test.ts cli.test.ts broker/cross-machine-provenance.test.ts broker/client.test.ts broker/client-liveness.test.ts broker/extension.test.ts broker/framing.test.ts broker/paths.test.ts broker/protocol.test.ts broker/runtime-claim.test.ts broker/spawn.test.ts config.test.ts cwd.test.ts format-context.test.ts project-agent.test.ts reply-tracker.test.ts wake/resolve.test.ts wake/policy.test.ts wake/audit.test.ts wake/sessiond.test.ts wake/controller.test.ts wake/trust.test.ts intercom.integration.test.ts human-priority.pi.test.ts test/inline-message.test.ts test/overlay-width.test.ts test/handover-picker.test.ts"
   },
   "keywords": [
     "pi-package"

@@ -12,7 +12,8 @@ import { InlineMessageComponent } from "./ui/inline-message.ts";
 import { getAskTimeoutMs, getIntercomScopeId, loadConfig, setIntercomScopeId, type IntercomConfig } from "./config.ts";
 import { EXTENSION_BUS_FEATURE } from "./types.ts";
 import "./wake/builtin.ts";
-import { WakeAudit, wakeAuditPath } from "./wake/audit.ts";
+import { WakeAudit, sha256, wakeAuditPath } from "./wake/audit.ts";
+import { WakeTrustStore, wakeTrustPath } from "./wake/trust.ts";
 import { findLiveWakeTarget, performWake, type WakeDeps } from "./wake/controller.ts";
 import { SAFE_MESSAGE_ID, WAKE_COMMAND, createWakeProvider } from "./wake/provider.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
@@ -1996,6 +1997,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       }),
       audit: new WakeAudit(wakeAuditPath(), wake.auditMaxEntries, wake.auditRetentionDays * 24 * 60 * 60 * 1000),
       ...(ctx.hasUI ? { confirm: (title: string, body: string) => ctx.ui.confirm(title, body) } : {}),
+      trust: new WakeTrustStore(wakeTrustPath()),
       self: { intercomId: connectedClient.sessionId, piSessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd },
     };
   }
@@ -2077,6 +2079,70 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       pi.appendEntry("intercom_wake", { messageId, outcome, timestamp: Date.now(), ...(detail ? { detail } : {}) });
     }
   }
+  /** /wake-trust on | off | list | revoke <Pi session id>. Changes always need the user's confirmation in a dialog. */
+  async function runWakeTrustCommand(args: string, ctx: ExtensionContext): Promise<void> {
+    const [sub = "", arg = ""] = args.trim().split(/\s+/);
+    const store = new WakeTrustStore(wakeTrustPath());
+    const self = { piSessionId: ctx.sessionManager.getSessionId(), name: pi.getSessionName()?.trim() || undefined, cwd: ctx.cwd };
+    const days = config.wake.trustDays;
+    const label = (e: { piSessionId: string; name?: string; cwd: string }) => `${e.name ? `"${e.name}" ` : ""}${e.piSessionId} in ${e.cwd}`;
+    const record = (outcome: "trust_granted" | "trust_revoked", subject: { piSessionId: string; name?: string; cwd: string }, detail: string) => {
+      new WakeAudit(wakeAuditPath(), config.wake.auditMaxEntries, config.wake.auditRetentionDays * 24 * 60 * 60 * 1000).append({
+        ts: Date.now(), outcome, code: outcome, messageId: `trust-${randomUUID()}`,
+        target: { piSessionId: subject.piSessionId, cwd: subject.cwd, ...(subject.name ? { name: subject.name } : {}) },
+        sender: { piSessionId: self.piSessionId, cwd: self.cwd }, textLength: 0, textSha256: sha256(""), detail,
+      });
+    };
+    const confirm = async (title: string, body: string): Promise<boolean> => {
+      if (!ctx.hasUI) {
+        notifyCommand(ctx, "/wake-trust changes need the user's confirmation in a dialog, and this session has no UI.", "error");
+        return false;
+      }
+      try { return await ctx.ui.confirm(title, body); } catch { return false; }
+    };
+    try {
+      if (sub === "list") {
+        const grants = store.list();
+        notifyCommand(ctx, grants.length
+          ? ["**Sessions allowed to wake without confirmation**", ...grants.map((g) => `- ${label(g)} until ${new Date(g.expiresAt).toISOString()}`)].join("\n")
+          : "No session is allowed to wake without confirmation.", "info");
+        return;
+      }
+      if (sub === "on") {
+        if (!await confirm("Allow this session to wake others without asking?", `Session ${label(self)} will be able to wake persisted sessions in the allowed directories without a confirmation dialog, for ${days} days or until you run /wake-trust off. Directory allowlist, secret check, duplicate window, rate limits and audit still apply.`)) {
+          notifyCommand(ctx, "Not changed.", "info");
+          return;
+        }
+        const entry = store.grant(self, days);
+        record("trust_granted", self, `until ${new Date(entry.expiresAt).toISOString()}`);
+        notifyCommand(ctx, `This session may now wake others without confirmation until ${new Date(entry.expiresAt).toISOString()}.`, "info");
+        return;
+      }
+      if (sub === "off" || sub === "revoke") {
+        const id = sub === "off" ? self.piSessionId : arg;
+        if (!id) {
+          notifyCommand(ctx, "Usage: /wake-trust revoke <full Pi session id> (see /wake-trust list).", "warning");
+          return;
+        }
+        const current = store.list().find((g) => g.piSessionId === id);
+        if (!current) {
+          notifyCommand(ctx, sub === "off" ? "This session has no permission to remove." : `No permission for ${id}.`, "info");
+          return;
+        }
+        if (!await confirm("Remove the permission to wake without asking?", `Session ${label(current)} will need your confirmation again for every wake.`)) {
+          notifyCommand(ctx, "Not changed.", "info");
+          return;
+        }
+        store.revoke(id);
+        record("trust_revoked", current, sub);
+        notifyCommand(ctx, `Removed: ${label(current)} needs confirmation again.`, "info");
+        return;
+      }
+      notifyCommand(ctx, "Usage: /wake-trust on | off | list | revoke <Pi session id>", "info");
+    } catch (error) {
+      notifyCommand(ctx, `/wake-trust failed: ${getErrorMessage(error)}`, "error");
+    }
+  }
   function runWakeStatusCommand(ctx: ExtensionContext): void {
     const wake = config.wake;
     const lines = [
@@ -2084,6 +2150,18 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       `Enabled: ${wake.enabled ? "yes" : "no"}`,
       `Provider: ${wake.provider}${createWakeProvider(wake.provider, {}) ? "" : " (not available)"}`,
       `Confirmation: ${wake.confirm}`,
+      ...(() => {
+        try {
+          const grants = new WakeTrustStore(wakeTrustPath()).list();
+          const mine = grants.find((g) => g.piSessionId === ctx.sessionManager.getSessionId());
+          return [
+            `This session may wake without confirmation: ${mine ? `yes, until ${new Date(mine.expiresAt).toISOString()}` : "no (/wake-trust on to allow it)"}`,
+            `Sessions allowed to wake without confirmation: ${grants.length}`,
+          ];
+        } catch (error) {
+          return [`Wake trust file unreadable (${getErrorMessage(error)}): every wake asks for confirmation`];
+        }
+      })(),
       `Allowed directories: ${wake.allowCwds.length ? wake.allowCwds.join(", ") : "none"}`,
       `Broker supports wake-v1: ${client?.supportsFeature("wake-v1") ? "yes" : "no"}`,
       `Limits: ${wake.perTargetMax} per ${Math.round(wake.perTargetWindowMs / 60_000)} min per session, ${wake.globalMax} per ${Math.round(wake.globalWindowMs / 60_000)} min in total, duplicates refused for ${Math.round(wake.dedupMs / 60_000)} min`,
@@ -3552,6 +3630,11 @@ Usage:
   pi.registerCommand(WAKE_COMMAND, {
     description: "Internal: run in a session that another session woke, to receive its held intercom message (no model call)",
     handler: async (args, ctx) => runWakeCommand(args, ctx),
+  });
+
+  pi.registerCommand("wake-trust", {
+    description: "Allow this session to wake other sessions without a confirmation dialog, or remove that permission (usage: /wake-trust on | off | list | revoke <Pi session id>)",
+    handler: async (args, ctx) => runWakeTrustCommand(args, ctx),
   });
 
   pi.registerCommand("intercom-wake-status", {

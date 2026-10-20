@@ -253,6 +253,31 @@ flowchart LR
 - Duplicate window and per-session / global rate limits are computed from the **audit file**, which every session of the user shares, so they hold across processes. A reservation is written before the wake and the limits are checked again with it counted, which closes the race between two sessions. A reservation whose attempt ends `failed` (the host refused, nothing happened) does not count.
 - Audit: `wake-audit.jsonl` next to `config.json`, mode 0600, bounded by entries and age. It records time, outcome, ids, directory, daemon version, text length and SHA-256 — **never the text**. If it cannot be written, nothing is woken.
 
+## 8.1 Trusted senders: `/wake-trust`
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant G as Session to trust (e.g. a coordinator)
+    participant F as wake-trust.json (0600)
+    participant A as wake-audit.jsonl
+    U->>G: /wake-trust on
+    G->>U: dialog "Allow this session to wake others without asking?"
+    U-->>G: confirm
+    G->>F: grant { piSessionId (read in-process), name and cwd for display, expiry = trustDays }
+    G->>A: trust_granted
+    Note over G: later wakes: trust.find(own piSessionId) → no dialog, even without a UI
+    U->>G: /wake-trust off (or from another session: /wake-trust revoke <id>)
+    G->>U: confirmation dialog
+    G->>F: remove
+    G->>A: trust_revoked
+```
+
+- Identity is the sender's Pi session id, read by the extension in its own process: another session cannot use it, and a name does not count (names are self-declared). A replacement coordinator is granted again; the old one is revoked or simply expires.
+- A grant removes only the dialog. Allowlist, secret check, duplicates, limits and audit still apply; every wake records `confirmedBy` (`user`, `trust`, `config`).
+- An unreadable or unknown file grants nothing (the dialog comes back); a new confirmed grant repairs it.
+- Limit: it does not defend against a hostile local process with shell access, which could also answer dialogs through PI WEB's API (same trust model as the confirmation itself).
+
 ## 9. Sessions that are already open and busy
 
 A session can be loaded in PI WEB but missing from the intercom roster (opened a moment ago, or with its intercom disconnected), so the sender treats it as persisted. Verified on an isolated daemon with a scripted local model (`scripts/e2e/run.sh busy`):
@@ -280,6 +305,7 @@ The closed form is the one side effect that cannot be avoided from intercom; the
 | `wake/resolve.ts` | exact resolution: full id, or exact unique name; never prefixes; archived refused |
 | `wake/policy.ts` | allowlist, secret-like content, size, duplicates, rate limits |
 | `wake/audit.ts` | JSONL 0600, hash and length, retention, tolerant reader |
+| `wake/trust.ts` | `/wake-trust` grants: 0600, atomic writes, expiry, fail closed |
 | `wake/controller.ts` | `performWake`, `findLiveWakeTarget` |
 | `wake/sessiond.ts`, `wake/builtin.ts` | PI WEB provider and its registration |
 | `index.ts` | tool option `wakeIfDisconnected`, `sendWithWake`, `/intercom-wake`, `/intercom-wake-status` |

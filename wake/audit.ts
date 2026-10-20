@@ -11,7 +11,9 @@ export type WakeOutcome =
   | "uncertain"           // the host's answer is unknown; the message stays held
   | "failed"              // the host refused; the held message was withdrawn
   | "refused"             // the user declined
-  | "blocked";            // a policy or validation check stopped it before anything was held
+  | "blocked"             // a policy or validation check stopped it before anything was held
+  | "trust_granted"       // the user allowed a session to wake others without confirmation (/wake-trust on)
+  | "trust_revoked";      // the user removed that permission
 
 export interface WakeAuditEntry {
   ts: number;
@@ -28,6 +30,8 @@ export interface WakeAuditEntry {
   provider?: string;
   daemon?: string;
   durationMs?: number;
+  /** How the wake was approved: the user in a dialog, a /wake-trust grant, or wake.confirm = "never". */
+  confirmedBy?: "user" | "trust" | "config";
   /** Short, content-free diagnostic. Never the message text. */
   detail?: string;
 }

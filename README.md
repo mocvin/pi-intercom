@@ -560,7 +560,7 @@ It is **off by default** and fail-closed. Settings under `wake` in `config.json`
 |---------|---------|-------------|
 | `wake.enabled` | false | Master switch. Waking loads a session and runs its extensions. |
 | `wake.allowCwds` | `[]` | Absolute directories whose sessions may be woken. Empty allows none. |
-| `wake.confirm` | `"always"` | `"always"` asks the user before every wake and blocks when there is no UI. `"never"` skips the dialog for allowlisted directories. |
+| `wake.confirm` | `"always"` | `"always"` asks the user before every wake and blocks when there is no UI, unless the sending session has a `/wake-trust` grant. `"never"` skips the dialog for every session in allowlisted directories. |
 | `wake.provider` | `"pi-web-sessiond"` | Registered provider id. |
 | `wake.sessiondSocket` / `wake.sessiondUrl` | — | Endpoint of the PI WEB session daemon. Otherwise `PI_WEB_SESSIOND_SOCKET` / `PI_WEB_SESSIOND_URL` is used. The endpoint is never guessed. A daemon started with its default socket does not export it to its sessions, so set `wake.sessiondSocket` (usually `~/.pi-web/sessiond.sock`, as an absolute path). |
 | `wake.dedupMs` | 600000 | An identical message to the same session inside this window is refused. |
@@ -570,6 +570,20 @@ It is **off by default** and fail-closed. Settings under `wake` in `config.json`
 | `wake.deliveryTimeoutMs` | 30000 | How long the sender waits for the woken session's receipt. |
 | `wake.receiveTimeoutMs` | 15000 | How long `/intercom-wake` waits inside the woken session for the held message. |
 | `wake.auditMaxEntries` / `wake.auditRetentionDays` | 1000 / 30 | Bounds of the audit file. |
+| `wake.trustDays` | 30 | Lifetime of a `/wake-trust` grant. |
+
+#### Trusted senders: `/wake-trust`
+
+With `confirm: "always"`, every wake asks the user. To let one session (for example a coordinator) wake others without the dialog, run `/wake-trust on` **in that session** and confirm. The permission belongs to that session's real Pi session id: it cannot be claimed by another session, and it does not move to a new session with the same name, so when you replace the coordinator you grant the new one and revoke the old one. It expires after `wake.trustDays` (30 by default).
+
+| Command | Effect |
+|---|---|
+| `/wake-trust on` | Allow this session to wake without a dialog (asks for confirmation) |
+| `/wake-trust off` | Remove this session's permission (asks for confirmation) |
+| `/wake-trust list` | Show the sessions that have the permission and when it expires |
+| `/wake-trust revoke <Pi session id>` | Remove another session's permission (asks for confirmation) |
+
+Changes always need the user's confirmation in a dialog, and a session without a UI cannot change them. A trusted session skips only the dialog: the directory allowlist, the secret check, the duplicate window, the rate limits and the audit still apply, and every wake records how it was approved (`confirmedBy: user | trust | config`). Grants are kept in `wake-trust.json` next to `config.json` (mode 0600); an unreadable file grants nothing; deleting it removes every grant. This protects against mistakes and against a model acting on its own, not against a hostile local process with shell access, which could also answer dialogs through PI WEB's API.
 
 Messages that look like secrets (tokens, private keys, passwords) or exceed 32 KiB are refused. Every attempt is recorded in `wake-audit.jsonl` next to `config.json` (mode 0600): time, outcome, ids, directory, text length and SHA-256, never the text. The duplicate window and the rate limits are computed from that file, so they hold across all sessions. If the audit cannot be written, nothing is woken. `/intercom-wake-status` shows the settings, whether the broker supports `wake-v1`, and recent attempts.
 

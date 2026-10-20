@@ -25,8 +25,10 @@ export interface WakeDeps {
   config: WakeConfig;
   provider: WakeProvider | undefined;
   audit: WakeAudit;
-  /** Ask the user; undefined when there is no UI, which blocks the wake unless confirm is "never". */
+  /** Ask the user; undefined when there is no UI, which blocks the wake unless confirm is "never" or the sender is trusted. */
   confirm?: (title: string, body: string) => Promise<boolean>;
+  /** /wake-trust grants. A sender with a valid grant is not asked to confirm; every other check still applies. */
+  trust?: { find(piSessionId: string, now?: number): { expiresAt: number } | undefined };
   self: { intercomId: string | null; piSessionId: string; cwd: string };
   now?: () => number;
 }
@@ -65,6 +67,9 @@ export async function performWake(deps: WakeDeps, request: WakeRequest): Promise
   const text = request.message;
   let target: { piSessionId: string; cwd: string; name?: string } | undefined;
   let daemon: string | undefined;
+  // Read once: a grant revoked while this wake runs still applies to it, never the other way round.
+  const trusted = Boolean(deps.trust?.find(deps.self.piSessionId, now()));
+  const confirmedBy: "user" | "trust" | "config" = trusted ? "trust" : config.confirm === "never" ? "config" : "user";
 
   const entry = (outcome: WakeOutcome, code: string, detail?: string): WakeAuditEntry => ({
     ts: now(),
@@ -79,6 +84,7 @@ export async function performWake(deps: WakeDeps, request: WakeRequest): Promise
     provider: provider?.id ?? config.provider,
     ...((daemon ?? provider?.describe?.()) ? { daemon: daemon ?? provider?.describe?.() } : {}),
     durationMs: now() - started,
+    confirmedBy,
     ...(detail ? { detail: detail.slice(0, 300) } : {}),
   });
   const done = (ok: boolean, outcome: WakeOutcome, code: string, message: string, detail?: string): WakeResult => {
@@ -103,7 +109,9 @@ export async function performWake(deps: WakeDeps, request: WakeRequest): Promise
   if (!cwdAllowed(config, cwd)) return blocked("cwd_not_allowed", `${cwd} is not in wake.allowCwds.`);
   const messageCheck = checkMessage(text);
   if (!messageCheck.ok) return blocked(messageCheck.code, messageCheck.detail);
-  if (config.confirm === "always" && !deps.confirm) return blocked("confirmation_unavailable", "Waking a session needs the user's confirmation and no UI is available.");
+  if (!trusted && config.confirm === "always" && !deps.confirm) {
+    return blocked("confirmation_unavailable", "Waking a session needs the user's confirmation and no UI is available. The user can allow this session to wake without confirmation with /wake-trust on.");
+  }
 
   // ---- Resolve the target in the host catalog (read-only).
   let name: string | undefined;
@@ -126,7 +134,7 @@ export async function performWake(deps: WakeDeps, request: WakeRequest): Promise
   const limit = checkLimits(config, audit.read(), { piSessionId: target.piSessionId, cwd, dedupKey }, now());
   if (limit) return blocked(limit.code, limit.detail);
 
-  if (config.confirm === "always") {
+  if (!trusted && config.confirm === "always") {
     const preview = text.length > 600 ? `${text.slice(0, 600)}…` : text;
     let approved = false;
     try {

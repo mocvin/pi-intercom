@@ -177,6 +177,7 @@ test("loadConfig leaves waking persisted sessions off, confirmed, and empty by d
       assert.equal(wake.dedupMs, 10 * 60_000);
       assert.equal(wake.auditRetentionDays, 30);
       assert.equal(wake.auditMaxEntries, 1000);
+      assert.equal(wake.trustDays, 30);
     });
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -199,6 +200,7 @@ test("loadConfig reads wake settings and rejects unknown or invalid ones", async
         [{ allowCwds: "/work" }, /"wake.allowCwds" must be an array of absolute/],
         [{ confirm: "sometimes" }, /"wake.confirm" must be "always" or "never"/],
         [{ dedupMs: 0 }, /"wake.dedupMs" must be a positive integer/],
+        [{ trustDays: -1 }, /"wake.trustDays" must be a positive integer/],
         [{ globalMax: 1.5 }, /"wake.globalMax" must be a positive integer/],
         [{ provider: " " }, /"wake.provider" must be a non-empty string/],
         [{ sessiondUrl: "" }, /"wake.sessiondUrl" must be a non-empty string/],
