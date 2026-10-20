@@ -516,6 +516,20 @@ intercom({ action: "send", to: "<full Pi session id, or an exact name unique in 
 
 If the host refuses the wake (not found, archived, rejected), the held message is withdrawn. If its answer is unknown (timeout, server error), the message stays held.
 
+### What it makes possible
+
+Without this, a session that is saved but not loaded can only be reached by reopening it by hand. With it, another session (or a script) can hand work or news to *that* session, which wakes up with its whole history and context, acts, and can answer back through intercom. Typical scenarios:
+
+- **Delegate to a long-lived project agent that is not loaded.** A coordinator or personal-assistant session sends a task to the saved "senior developer" session of a repository. The developer session reopens with everything it already knows about that codebase, does the work, and replies with `intercom send`, instead of a fresh session starting from zero.
+- **Planner and workers across days.** Worker sessions are saved between work days. When something happens for one of them (a CI failure, a review comment, a new requirement), the planner wakes exactly that worker with a short brief.
+- **Answer back to a requester that is no longer loaded.** A session finishes a long job after the session that asked for it was unloaded. It sends the result with `wakeIfDisconnected`, and the requester reopens to read and act on it.
+- **Brief a saved specialist instead of starting a new session.** Send a summary or a next step to the saved session that already holds the right context (an analysis of a system, an incident, a customer), rather than re-explaining it in a new one.
+- **After a PI WEB daemon restart.** Every session is unloaded after a restart. A coordinating session can wake only the few sessions it needs to talk to, instead of the user reopening them one by one.
+- **Unattended, scheduled hand-offs.** With `wake.confirm: "never"` and a narrow `wake.allowCwds`, a scheduled job or an automation without a UI can wake a dedicated session (for example a nightly reporting session). With the default `"always"`, an unattended wake is refused.
+- **Another host than PI WEB.** The host is behind the `WakeProvider` interface. A different launcher can register its own provider and get the same queue-once, deliver-once behavior.
+
+What it deliberately does not do: it never wakes a session by a guessed name or an id prefix, never wakes several sessions at once, never wakes a session outside the allowed directories, never wakes the current session, and does not support blocking `ask`, `reply`, handovers or cross-machine targets. It sends one plain message; the woken session decides what to do with it.
+
 It is **off by default** and fail-closed. Settings under `wake` in `config.json`:
 
 ```json
