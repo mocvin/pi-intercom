@@ -516,6 +516,19 @@ intercom({ action: "send", to: "<full Pi session id, or an exact name unique in 
 
 If the host refuses the wake (not found, archived, rejected), the held message is withdrawn. If its answer is unknown (timeout, server error), the message stays held.
 
+### Installing this fork
+
+This feature ships in a fork of pi-intercom published as the package **`pi-intercom-wake`** ([mocvin/pi-intercom](https://github.com/mocvin/pi-intercom), branch `wake-v1`). It is a **drop-in replacement**, not an add-on: it registers the same `intercom` tool and commands and uses the same broker and `~/.pi/agent/intercom` directory, so it must not be installed next to `npm:pi-intercom`. Remove the original first:
+
+```sh
+pi remove npm:pi-intercom
+pi install npm:pi-intercom-wake                                   # from npm
+# or, pinned to a release tag, straight from GitHub:
+pi install git:github.com/mocvin/pi-intercom@v0.17.1-wake.1
+```
+
+Then restart the intercom broker once (it is a long-lived process that keeps running the old code) and `/reload` the sessions; see [`docs/session-waker/INSTALL.md`](docs/session-waker/INSTALL.md). Sessions that still run the original pi-intercom keep working with this broker, and the other way round. To go back, remove `pi-intercom-wake`, install `npm:pi-intercom` again, and restart the broker.
+
 ### What it makes possible
 
 Without this, a session that is saved but not loaded can only be reached by reopening it by hand. With it, another session (or a script) can hand work or news to *that* session, which wakes up with its whole history and context, acts, and can answer back through intercom. Typical scenarios:

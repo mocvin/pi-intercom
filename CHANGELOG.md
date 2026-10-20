@@ -4,6 +4,9 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Fork
+- Published as `pi-intercom-wake` (version `0.17.1-wake.1`), a drop-in replacement for `pi-intercom` with the wake feature: same tool, commands, broker and runtime directory, so install one or the other, never both.
+
 ### Added
 - `send` with `wakeIfDisconnected: true` reaches a persisted Pi session that is not connected: the message is held once in the broker (`wake-v1`), the session is reopened through a wake provider, and the internal `/intercom-wake` command lets the message arrive without a model call. Opt-in (`wake.enabled`), restricted to `wake.allowCwds`, confirmed by the user, with secret-content, duplicate and rate-limit guards and a private audit file (hash and length of the text, never the text). Plain sends only. The built-in `pi-web-sessiond` provider uses internal PI WEB session daemon routes (`commands/run`, so a session without the command refuses it instead of passing it to its model) and is experimental; other hosts can register a provider. `/intercom-wake-status` shows the settings and recent attempts.
 - The broker can hold a message for a persisted Pi session that is not connected and that it has never seen (`send` with a `wake` target, broker feature `wake-v1`). The target is exact: a Pi session id plus an absolute directory. The message is queued once in the mailbox, with delivery `queued` and code `wake_pending`, and released when a session with that Pi session id and directory registers. It reuses the mailbox limits (24 hours, 256 messages), replay guard, cancellation, receipts and routing scopes. A wake send is plain only (no reply, ask or supersede), cannot target the sender, and is delivered normally when the target is already connected. A client that is connected to a broker without `wake-v1` refuses a wake send before anything is sent. Nothing reopens a session yet; that is a separate step.
