@@ -5,7 +5,7 @@ import { writeMessage, createMessageReader } from "./framing.ts";
 import { getBrokerConnectTarget, type BrokerConnectTarget } from "./paths.ts";
 import { isMessage, isMessageControl, isMessageReceipt, isSessionInfo } from "./protocol.ts";
 import { getIntercomScopeId } from "../config.ts";
-import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_HELD_ERROR_CODE, type DeliveryDetails } from "../types.ts";
+import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_HELD_ERROR_CODE, WAKE_FEATURE, type DeliveryDetails, type WakeTarget } from "../types.ts";
 import type {
   Attachment,
   BrokerMessage,
@@ -30,6 +30,12 @@ interface SendOptions {
   retryOf?: string;
   provenance?: MessageProvenance;
   crossMachine?: CrossMachineProvenance;
+  /**
+   * Hold the message for a persisted Pi session that may not be connected (broker feature `wake-v1`).
+   * The target is exact (Pi session id + cwd) and `to` must be that Pi session id. Plain messages only.
+   * This does not reopen the session; the caller does that after the broker answers `queued`.
+   */
+  wake?: WakeTarget;
 }
 
 export interface SendResult extends DeliveryDetails {
@@ -643,6 +649,20 @@ export class IntercomClient extends EventEmitter {
       throw toError(error);
     }
     
+    if (options.wake) {
+      const unsupported = !this.supportsFeature(WAKE_FEATURE)
+        ? { code: "E_WAKE_UNSUPPORTED", reason: "The intercom broker does not support waking persisted sessions (wake-v1). Restart the broker on a version that does." }
+        : options.replyTo || options.expectsReply || options.supersedes
+          ? { code: "E_WAKE_UNSUPPORTED", reason: "A wake send supports plain messages only (no replyTo, expectsReply, or supersedes)." }
+          : to !== options.wake.piSessionId
+            ? { code: "E_INVALID_WAKE", reason: "A wake send must be addressed to the Pi session id of its wake target." }
+            : null;
+      if (unsupported) {
+        // Fail closed before anything reaches the broker.
+        return { id: options.messageId ?? randomUUID(), delivered: false, delivery: "failed", retryable: false, outcomeKnown: true, ...unsupported };
+      }
+    }
+
     const messageId = options.messageId ?? randomUUID();
     const message: Message = {
       id: messageId,
@@ -678,7 +698,7 @@ export class IntercomClient extends EventEmitter {
       this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
 
       try {
-        writeMessage(socket, { type: "send", to, message, ...(targetId && targetEpoch ? { targetId, targetEpoch } : {}) });
+        writeMessage(socket, { type: "send", to, message, ...(targetId && targetEpoch ? { targetId, targetEpoch } : {}), ...(options.wake ? { wake: options.wake } : {}) });
       } catch (error) {
         clearTimeout(timeout);
         this.pendingSends.delete(messageId);
@@ -686,7 +706,7 @@ export class IntercomClient extends EventEmitter {
       }
     });
 
-    if (!this.supportsFeature(EXACT_SEND_FEATURE) || options.replyTo) {
+    if (!this.supportsFeature(EXACT_SEND_FEATURE) || options.replyTo || options.wake) {
       return sendOnce();
     }
 

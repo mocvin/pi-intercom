@@ -2,10 +2,28 @@ export const EXTENSION_BUS_FEATURE = "extension-bus-v1";
 export const EXACT_SEND_FEATURE = "exact-send-v1";
 /** The broker records and reports a registrant's real Pi session id (`SessionInfo.piSessionId`). */
 export const PI_SESSION_ID_FEATURE = "pi-session-id-v1";
+/**
+ * The broker can hold a message for a Pi session that is not connected and has never been seen
+ * (`send.wake`), and releases it when that session registers. See docs/session-waker/ARCHITECTURE.md.
+ */
+export const WAKE_FEATURE = "wake-v1";
+/** `delivered.code` of a message held for a persisted Pi session that has to be reopened. */
+export const WAKE_PENDING_CODE = "wake_pending";
+/** Upper bound for the cwd of a wake target. */
+export const MAX_WAKE_CWD_LENGTH = 4096;
 /** Upper bound for a self-asserted Pi session id; real ids are UUIDs. */
 export const MAX_PI_SESSION_ID_LENGTH = 256;
 /** Broker refused a register because another live process holds the session id. */
 export const SESSION_HELD_ERROR_CODE = "E_SESSION_HELD";
+
+/**
+ * Identifies a persisted Pi session that may not be connected: the real Pi session id plus the
+ * working directory it belongs to. Matching is exact on both; names never match a wake target.
+ */
+export interface WakeTarget {
+  piSessionId: string;
+  cwd: string;
+}
 
 export type DeliveryState = "socket_delivered" | "queued" | "failed" | "unknown";
 
@@ -165,7 +183,7 @@ export type ClientMessage =
   | { type: "unregister" }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
   | { type: "list"; requestId: string }
-  | { type: "send"; to: string; message: Message; targetId?: string; targetEpoch?: string }
+  | { type: "send"; to: string; message: Message; targetId?: string; targetEpoch?: string; wake?: WakeTarget }
   | { type: "message_receipt"; receipt: MessageReceipt }
   | { type: "cancel_message"; messageId: string }
   | { type: "cancel_ask"; messageId: string }

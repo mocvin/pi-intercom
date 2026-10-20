@@ -5,6 +5,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 ## [Unreleased]
 
 ### Added
+- The broker can hold a message for a persisted Pi session that is not connected and that it has never seen (`send` with a `wake` target, broker feature `wake-v1`). The target is exact: a Pi session id plus an absolute directory. The message is queued once in the mailbox, with delivery `queued` and code `wake_pending`, and released when a session with that Pi session id and directory registers. It reuses the mailbox limits (24 hours, 256 messages), replay guard, cancellation, receipts and routing scopes. A wake send is plain only (no reply, ask or supersede), cannot target the sender, and is delivered normally when the target is already connected. A client that is connected to a broker without `wake-v1` refuses a wake send before anything is sent. Nothing reopens a session yet; that is a separate step.
 - Sessions now report their real Pi session id as `piSessionId` in the roster, and the broker advertises the additive `pi-session-id-v1` feature. The intercom `id` can be a pinned stable id or a claimed alias, so it does not always identify the Pi session behind it. Older clients and brokers keep working unchanged: the field is optional, validated (non-empty string, at most 256 characters) and absent for clients that never send it.
 - In fullscreen mode, clicking an intercom message expands or collapses just that message. Ctrl+O still expands or collapses all of them at once. Thanks to [@summer-tt](https://github.com/summer-tt) for #178.
 

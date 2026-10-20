@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkS
 import { join } from "path";
 import { createHash, randomUUID } from "crypto";
 import { writeMessage, createMessageReader, MAX_FRAME_BYTES } from "./framing.ts";
-import { isMessage, isMessageReceipt, isSessionId, isSessionRegistration, messageDeliveryFingerprint } from "./protocol.ts";
+import { isMessage, isMessageReceipt, isSessionId, isSessionRegistration, isWakeTarget, messageDeliveryFingerprint } from "./protocol.ts";
 import {
   ensureIntercomRuntimeDir,
   getBrokerListenTarget,
@@ -18,8 +18,8 @@ import {
 } from "./paths.ts";
 import { getAskTimeoutMs } from "../config.ts";
 import { sameCwd } from "../cwd.ts";
-import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, PI_SESSION_ID_FEATURE, SESSION_HELD_ERROR_CODE } from "../types.ts";
-import type { DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, MessageReceiptStatus } from "../types.ts";
+import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, PI_SESSION_ID_FEATURE, SESSION_HELD_ERROR_CODE, WAKE_FEATURE, WAKE_PENDING_CODE } from "../types.ts";
+import type { DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, MessageReceiptStatus, WakeTarget } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
 import { resolveHerdrLocations } from "../herdr-location.ts";
@@ -157,6 +157,8 @@ interface MailboxMessage {
   targetScopeId?: string;
   message: Message;
   queuedAt: number;
+  /** Present for mail held for a persisted Pi session the broker has never seen connected. */
+  wake?: WakeTarget;
 }
 
 function normalizeScopeId(value: unknown): string | undefined {
@@ -596,7 +598,7 @@ class IntercomBroker {
         writeMessage(socket, {
           type: "registered",
           sessionId: id,
-          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE, PI_SESSION_ID_FEATURE],
+          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE, PI_SESSION_ID_FEATURE, WAKE_FEATURE],
         });
         this.broadcast({ type: "session_joined", session: info }, key, scopeId);
 
@@ -736,6 +738,10 @@ class IntercomBroker {
         const brokerReceivedAt = Date.now();
         this.pruneAskEdges();
         this.pruneMessageReceiptRoutes(brokerReceivedAt);
+        if (clientMessage.wake !== undefined) {
+          this.handleWakeSend(socket, currentKey, fromSession, message, clientMessage, brokerReceivedAt);
+          break;
+        }
         const replyEdge = message.replyTo ? this.askEdges.get(message.replyTo) : undefined;
 
         const hasTargetId = clientMessage.targetId !== undefined;
@@ -1120,7 +1126,7 @@ class IntercomBroker {
     }
   }
 
-  private queueMailboxMessage(from: ConnectedSession, target: DisconnectedSession, message: Message, brokerReceivedAt: number): void {
+  private queueMailboxMessage(from: ConnectedSession, target: DisconnectedSession, message: Message, brokerReceivedAt: number, wake?: WakeTarget): void {
     this.pruneMailboxMessages(brokerReceivedAt);
     while (this.mailboxMessages.length >= MAX_MAILBOX_MESSAGES) {
       const evicted = this.mailboxMessages.shift();
@@ -1141,11 +1147,76 @@ class IntercomBroker {
       ...(target.scopeId ? { targetScopeId: target.scopeId } : {}),
       message: { ...message, brokerReceivedAt },
       queuedAt: brokerReceivedAt,
+      ...(wake ? { wake: { piSessionId: wake.piSessionId, cwd: wake.cwd } } : {}),
     });
   }
 
-  private writeDeliverySuccess(socket: net.Socket, messageId: string, delivery: "socket_delivered" | "queued"): void {
-    writeMessage(socket, { type: "delivered", messageId, delivery, retryable: false, outcomeKnown: true });
+  /** True when a registered session is the persisted Pi session a wake target names (exact id and directory, same scope). */
+  private matchesWakeTarget(session: ConnectedSession, wake: WakeTarget, scopeId: string | undefined): boolean {
+    if (!sameScope(session.scopeId, scopeId) || !sameCwd(session.info.cwd, wake.cwd)) return false;
+    if (session.info.piSessionId !== undefined) return session.info.piSessionId === wake.piSessionId;
+    // A client that predates pi-session-id-v1 reports no Pi session id; its intercom id is the Pi session id unless pinned.
+    return session.info.id === wake.piSessionId;
+  }
+
+  private handleWakeSend(
+    socket: net.Socket,
+    currentKey: string,
+    fromSession: ConnectedSession,
+    message: Message,
+    clientMessage: Record<string, unknown>,
+    brokerReceivedAt: number,
+  ): void {
+    const wake = clientMessage.wake;
+    if (!isWakeTarget(wake) || clientMessage.to !== wake.piSessionId) {
+      this.writeDeliveryFailure(socket, message.id, "Invalid wake target: an exact Pi session id and an absolute cwd are required, and 'to' must be that Pi session id", "E_INVALID_WAKE");
+      return;
+    }
+    if (clientMessage.targetId !== undefined || clientMessage.targetEpoch !== undefined) {
+      this.writeDeliveryFailure(socket, message.id, "A wake send cannot also name an exact endpoint", "E_INVALID_WAKE");
+      return;
+    }
+    if (message.replyTo || message.expectsReply || message.supersedes) {
+      this.writeDeliveryFailure(socket, message.id, "A wake send supports plain messages only (no replyTo, expectsReply, or supersedes)", "E_WAKE_UNSUPPORTED");
+      return;
+    }
+    if (fromSession.info.piSessionId === wake.piSessionId) {
+      this.writeDeliveryFailure(socket, message.id, "Cannot wake the sending session", "E_WAKE_SELF");
+      return;
+    }
+    const fingerprint = messageDeliveryFingerprint(message, wake.piSessionId, wake);
+    if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) return;
+
+    const live = Array.from(this.sessions.values()).filter(session => session.key !== currentKey && this.matchesWakeTarget(session, wake, fromSession.scopeId));
+    if (live.length > 1) {
+      this.writeDeliveryFailure(socket, message.id, `Multiple connected sessions match Pi session ${wake.piSessionId} in ${wake.cwd}.`, "E_AMBIGUOUS_TARGET");
+      return;
+    }
+    if (live.length === 1) {
+      // Already connected (it may have just reconnected): ordinary delivery, nothing to wake.
+      const target = live[0]!;
+      this.messageReceiptRoutes.set(message.id, { from: currentKey, to: target.key, createdAt: brokerReceivedAt });
+      writeMessage(target.socket, {
+        type: "message",
+        from: fromSession.info,
+        message: { ...message, brokerReceivedAt, brokerDeliveredAt: Date.now() },
+      });
+      this.completeSocketDelivery(socket, currentKey, fromSession.scopeId, target, message, fingerprint);
+      return;
+    }
+    const placeholder: DisconnectedSession = {
+      info: { id: wake.piSessionId, piSessionId: wake.piSessionId, cwd: wake.cwd, model: "unknown", pid: 0, startedAt: 0, lastActivity: 0 },
+      key: scopedSessionKey(fromSession.scopeId, wake.piSessionId),
+      ...(fromSession.scopeId ? { scopeId: fromSession.scopeId } : {}),
+      disconnectedAt: brokerReceivedAt,
+    };
+    this.queueMailboxMessage(fromSession, placeholder, message, brokerReceivedAt, wake);
+    this.recordDelivery(currentKey, message.id, fingerprint, "queued", undefined, WAKE_PENDING_CODE);
+    this.writeDeliverySuccess(socket, message.id, "queued", WAKE_PENDING_CODE);
+  }
+
+  private writeDeliverySuccess(socket: net.Socket, messageId: string, delivery: "socket_delivered" | "queued", code?: string): void {
+    writeMessage(socket, { type: "delivered", messageId, delivery, retryable: false, outcomeKnown: true, ...(code ? { code } : {}) });
   }
 
   private writeDeliveryFailure(socket: net.Socket, messageId: string, reason: string, code: string, retryable = false): void {
@@ -1247,7 +1318,7 @@ class IntercomBroker {
       return false;
     }
     if (record.state === "socket_delivered" || record.state === "queued") {
-      this.writeDeliverySuccess(socket, messageId, record.state);
+      this.writeDeliverySuccess(socket, messageId, record.state, record.code);
     } else {
       this.writeDeliveryFailure(socket, messageId, record.reason ?? "Previous delivery failed", record.code ?? "E_DELIVERY_FAILED", record.retryable);
     }
@@ -1297,7 +1368,14 @@ class IntercomBroker {
         index += 1;
         continue;
       }
-      const matchesId = entry.targetKey === session.key;
+      if (entry.wake) {
+        // Mail held for a persisted session matches that session only: never by name, never by a bare id match in another directory.
+        if (!this.matchesWakeTarget(session, entry.wake, entry.targetScopeId)) {
+          index += 1;
+          continue;
+        }
+      }
+      const matchesId = entry.wake ? true : entry.targetKey === session.key;
       const matchesSenderIdentity = Boolean(
         sessionName
         && sameScope(entry.fromScopeId, session.scopeId)
@@ -1305,7 +1383,8 @@ class IntercomBroker {
         && sameCwd(entry.from.cwd, session.info.cwd),
       );
       const matchesUniqueName = Boolean(
-        uniqueMailboxIdentity
+        !entry.wake
+        && uniqueMailboxIdentity
         && sessionName
         && !matchesSenderIdentity
         && entry.target.name?.toLowerCase() === sessionName

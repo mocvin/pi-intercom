@@ -1,4 +1,5 @@
-import { MAX_PI_SESSION_ID_LENGTH } from "../types.ts";
+import { isAbsolute } from "path";
+import { MAX_PI_SESSION_ID_LENGTH, MAX_WAKE_CWD_LENGTH } from "../types.ts";
 import type {
   Attachment,
   Message,
@@ -8,6 +9,7 @@ import type {
   MessageReceiptStatus,
   SessionInfo,
   SessionRegistration,
+  WakeTarget,
 } from "../types.ts";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -18,6 +20,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function isOptionalPiSessionId(value: unknown): boolean {
   return value === undefined
     || (typeof value === "string" && value.trim().length > 0 && value.length <= MAX_PI_SESSION_ID_LENGTH);
+}
+
+export function isWakeTarget(value: unknown): value is WakeTarget {
+  if (!isRecord(value)) return false;
+  return typeof value.piSessionId === "string"
+    && isOptionalPiSessionId(value.piSessionId)
+    && typeof value.cwd === "string"
+    && value.cwd.length > 0
+    && value.cwd.length <= MAX_WAKE_CWD_LENGTH
+    && isAbsolute(value.cwd);
 }
 
 function isHerdrLocation(value: unknown): boolean {
@@ -168,9 +180,10 @@ export function isMessage(value: unknown): value is Message {
 }
 
 /** Canonical authored-message identity used by the broker's replay guard. */
-export function messageDeliveryFingerprint(message: Message, targetId: string): string {
+export function messageDeliveryFingerprint(message: Message, targetId: string, wake?: WakeTarget): string {
   return JSON.stringify({
     targetId,
+    wake: wake ? { piSessionId: wake.piSessionId, cwd: wake.cwd } : undefined,
     text: message.content.text,
     attachments: message.content.attachments,
     replyTo: message.replyTo,

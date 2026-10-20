@@ -416,7 +416,7 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
     assert.deepEqual(registerMessages, [{
       type: "registered",
       sessionId: "authorized-tcp-client",
-      features: ["extension-bus-v1", "exact-send-v1", "pi-session-id-v1"],
+      features: ["extension-bus-v1", "exact-send-v1", "pi-session-id-v1", "wake-v1"],
     }]);
   } finally {
     if (broker.exitCode === null && broker.signalCode === null) {
@@ -1982,6 +1982,307 @@ test("extension reports the Pi session id when the intercom id is the Pi session
     if (previousPublishedId === undefined) delete process.env.PI_INTERCOM_SESSION_ID;
     else process.env.PI_INTERCOM_SESSION_ID = previousPublishedId;
     await cleanup();
+  }
+});
+
+// ---- wake-v1: mail held for a persisted Pi session the broker has never seen connected ----
+
+const wakeReg = (name: string, extra: Record<string, unknown> = {}) => ({
+  name, cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now(), ...extra,
+});
+const WAKE_PI_ID = "0198a0a0-aaaa-7bbb-8ccc-ddddeeeeffff";
+
+async function connectWakeTarget(client: InstanceType<typeof IntercomClient>, intercomId: string | undefined, registration: Record<string, unknown>): Promise<Message[]> {
+  const received: Message[] = [];
+  client.on("message", (_from: SessionInfo, message: Message) => received.push(message));
+  await client.connect(registration as never, intercomId);
+  return received;
+}
+
+test("wake-v1 holds a message once for an unknown persisted session and releases it on registration", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const target = new IntercomClient();
+  const receipts: string[] = [];
+  const unsubscribe = planner.onMessageReceipt((_from, receipt) => { if (receipt.messageId === "wake-once") receipts.push(receipt.status); });
+  try {
+    assert.equal(planner.supportsFeature("wake-v1"), true);
+    const queued = await planner.send(WAKE_PI_ID, { messageId: "wake-once", text: "Please pick this up", wake: { piSessionId: WAKE_PI_ID, cwd: repoDir } });
+    assert.equal(queued.delivered, true);
+    assert.equal(queued.delivery, "queued");
+    assert.equal(queued.code, "wake_pending");
+    // Held, not delivered, and invisible in the roster: the broker has never seen this session.
+    assert.equal((await planner.listSessions()).some((session) => session.piSessionId === WAKE_PI_ID), false);
+
+    // The woken session registers under its own intercom id; the Pi session id is what identifies it.
+    const received = await connectWakeTarget(target, undefined, wakeReg("woken", { piSessionId: WAKE_PI_ID }));
+    const message = await waitForReplyMessage(received, "wake-once");
+    assert.equal(message.content.text, "Please pick this up");
+    target.sendMessageReceipt({ messageId: "wake-once", status: "receiver_received", timestamp: Date.now() });
+    await waitForCondition(() => receipts.includes("receiver_received"), "receipt routed back to the original sender");
+
+    // Delivered exactly once: a later reconnect finds an empty mailbox.
+    await target.disconnect();
+    const again = new IntercomClient();
+    try {
+      const receivedAgain = await connectWakeTarget(again, undefined, wakeReg("woken-again", { piSessionId: WAKE_PI_ID }));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.deepEqual(receivedAgain.map((m) => m.id), []);
+    } finally { await again.disconnect().catch(() => undefined); }
+  } finally {
+    unsubscribe();
+    await target.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("wake-v1 mail goes only to the exact Pi session id and directory, never by name or lookalike", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const clients: Array<InstanceType<typeof IntercomClient>> = [];
+  const connect = async (id: string | undefined, registration: Record<string, unknown>) => {
+    const client = new IntercomClient();
+    clients.push(client);
+    return connectWakeTarget(client, id, registration);
+  };
+  try {
+    assert.equal((await planner.send(WAKE_PI_ID, { messageId: "wake-exact", text: "exact only", wake: { piSessionId: WAKE_PI_ID, cwd: repoDir } })).delivery, "queued");
+
+    // Same name, same directory, different Pi session: not the target.
+    const sameName = await connect(undefined, wakeReg("woken", { piSessionId: "0198a0a0-0000-7000-8000-000000000001" }));
+    // Same Pi session id in another directory: not the target.
+    const otherDir = await connect("other-dir-intercom-id", wakeReg("woken", { piSessionId: WAKE_PI_ID, cwd: path.join(repoDir, "elsewhere") }));
+    // A legacy client whose intercom id equals the Pi session id but runs elsewhere: not the target.
+    const legacyElsewhere = await connect(WAKE_PI_ID, wakeReg("legacy-elsewhere", { cwd: path.join(repoDir, "elsewhere") }));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    for (const received of [sameName, otherDir, legacyElsewhere]) assert.deepEqual(received.map((m) => m.id), []);
+  } finally {
+    await Promise.all(clients.map((client) => client.disconnect().catch(() => undefined)));
+    await cleanup();
+  }
+
+  // And it still reaches the real target afterwards (fresh broker per test: queue again, then register correctly).
+  const second = await setupClients();
+  const target = new IntercomClient();
+  try {
+    assert.equal((await second.planner.send(WAKE_PI_ID, { messageId: "wake-exact-2", text: "exact only", wake: { piSessionId: WAKE_PI_ID, cwd: repoDir } })).delivery, "queued");
+    const received = await connectWakeTarget(target, "pinned-stable-id", wakeReg("woken", { piSessionId: WAKE_PI_ID }));
+    await waitForReplyMessage(received, "wake-exact-2");
+    assert.equal(target.sessionId, "pinned-stable-id", "a pinned intercom id does not stop the Pi session id from matching");
+  } finally {
+    await target.disconnect().catch(() => undefined);
+    await second.cleanup();
+  }
+});
+
+test("wake-v1 also reaches a legacy client whose intercom id is the Pi session id", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const legacy = new IntercomClient();
+  try {
+    assert.equal((await planner.send(WAKE_PI_ID, { messageId: "wake-legacy", text: "for an older client", wake: { piSessionId: WAKE_PI_ID, cwd: repoDir } })).delivery, "queued");
+    const received = await connectWakeTarget(legacy, WAKE_PI_ID, wakeReg("legacy-worker"));
+    await waitForReplyMessage(received, "wake-legacy");
+  } finally {
+    await legacy.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("wake-v1 delivers normally when the target is already connected and holds nothing", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const live = new IntercomClient();
+  const later = new IntercomClient();
+  try {
+    const received = await connectWakeTarget(live, undefined, wakeReg("live-target", { piSessionId: WAKE_PI_ID }));
+    const result = await planner.send(WAKE_PI_ID, { messageId: "wake-live", text: "already here", wake: { piSessionId: WAKE_PI_ID, cwd: repoDir } });
+    assert.equal(result.delivered, true);
+    assert.equal(result.delivery, "socket_delivered");
+    assert.equal(result.code, undefined);
+    await waitForReplyMessage(received, "wake-live");
+    // Nothing was queued: a second process for the same session later receives nothing.
+    await live.disconnect();
+    const laterReceived = await connectWakeTarget(later, undefined, wakeReg("live-target-2", { piSessionId: WAKE_PI_ID }));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(laterReceived.map((m) => m.id), []);
+  } finally {
+    await live.disconnect().catch(() => undefined);
+    await later.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("wake-v1 replays an identical retry without a second copy and rejects a changed one", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const target = new IntercomClient();
+  try {
+    const wake = { piSessionId: WAKE_PI_ID, cwd: repoDir };
+    const first = await planner.send(WAKE_PI_ID, { messageId: "wake-replay", text: "same", wake });
+    const retry = await planner.send(WAKE_PI_ID, { messageId: "wake-replay", text: "same", wake });
+    assert.equal(first.delivery, "queued");
+    assert.equal(retry.delivery, "queued");
+    assert.equal(retry.code, "wake_pending", "a replayed answer keeps the wake_pending code");
+    const changedText = await planner.send(WAKE_PI_ID, { messageId: "wake-replay", text: "different", wake });
+    assert.equal(changedText.delivered, false);
+    assert.equal(changedText.code, "E_MESSAGE_ID_REUSE");
+    const changedTarget = await planner.send(WAKE_PI_ID, { messageId: "wake-replay", text: "same", wake: { ...wake, cwd: path.join(repoDir, "elsewhere") } });
+    assert.equal(changedTarget.code, "E_MESSAGE_ID_REUSE", "the wake target is part of the authored identity");
+
+    const received = await connectWakeTarget(target, undefined, wakeReg("woken", { piSessionId: WAKE_PI_ID }));
+    await waitForReplyMessage(received, "wake-replay");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(received.filter((message) => message.id === "wake-replay").length, 1);
+  } finally {
+    await target.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("wake-v1 lets the sender cancel a held message before the session returns", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const target = new IntercomClient();
+  try {
+    await planner.send(WAKE_PI_ID, { messageId: "wake-cancel", text: "never mind", wake: { piSessionId: WAKE_PI_ID, cwd: repoDir } });
+    assert.equal((await planner.cancelMessage("wake-cancel")).delivered, true);
+    const received = await connectWakeTarget(target, undefined, wakeReg("woken", { piSessionId: WAKE_PI_ID }));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(received.map((m) => m.id), []);
+  } finally {
+    await target.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("wake-v1 refuses malformed wake sends, replies, asks, self-wake and exact-endpoint mixes", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const raw = await connectRawRegistered("wake-raw-sender", "wake-raw-sender", { piSessionId: "0198a0a0-5e1f-7000-8000-00000000cafe" });
+  const { createMessageReader } = await import("./broker/framing.ts");
+  const results: Record<string, unknown>[] = [];
+  const reader = createMessageReader((received) => {
+    if (typeof received === "object" && received !== null && "type" in received && (received.type === "delivery_failed" || received.type === "delivered")) results.push(received as Record<string, unknown>);
+  }, () => undefined);
+  raw.socket.on("data", reader);
+  const sendRaw = async (id: string, to: unknown, wake: unknown, extra: Record<string, unknown> = {}, messageExtra: Record<string, unknown> = {}) => {
+    raw.writeMessage(raw.socket, { type: "send", to, wake, ...extra, message: { id, timestamp: Date.now(), content: { text: "x" }, ...messageExtra } });
+    await waitForCondition(() => results.some((result) => result.messageId === id), `result for ${id}`);
+    return results.find((result) => result.messageId === id)!;
+  };
+  try {
+    const good = { piSessionId: WAKE_PI_ID, cwd: repoDir };
+    assert.equal((await sendRaw("w-rel-cwd", WAKE_PI_ID, { piSessionId: WAKE_PI_ID, cwd: "relative/dir" })).code, "E_INVALID_WAKE");
+    assert.equal((await sendRaw("w-empty-id", "", { piSessionId: "", cwd: repoDir })).code, "E_INVALID_WAKE");
+    assert.equal((await sendRaw("w-long-id", "x".repeat(300), { piSessionId: "x".repeat(300), cwd: repoDir })).code, "E_INVALID_WAKE");
+    assert.equal((await sendRaw("w-not-object", WAKE_PI_ID, "oops")).code, "E_INVALID_WAKE");
+    assert.equal((await sendRaw("w-to-mismatch", "someone-else", good)).code, "E_INVALID_WAKE", "to must be the Pi session id: a name can never steer a wake");
+    assert.equal((await sendRaw("w-exact-mix", WAKE_PI_ID, good, { targetId: "x", targetEpoch: "y" })).code, "E_INVALID_WAKE");
+    assert.equal((await sendRaw("w-ask", WAKE_PI_ID, good, {}, { expectsReply: true })).code, "E_WAKE_UNSUPPORTED");
+    assert.equal((await sendRaw("w-reply", WAKE_PI_ID, good, {}, { replyTo: "m" })).code, "E_WAKE_UNSUPPORTED");
+    assert.equal((await sendRaw("w-supersede", WAKE_PI_ID, good, {}, { supersedes: "m" })).code, "E_WAKE_UNSUPPORTED");
+    const self = { piSessionId: "0198a0a0-5e1f-7000-8000-00000000cafe", cwd: repoDir };
+    assert.equal((await sendRaw("w-self", self.piSessionId, self)).code, "E_WAKE_SELF");
+    assert.equal(results.some((result) => result.delivery === "queued"), false, "nothing was held");
+    // The client refuses the same cases before anything reaches the broker.
+    assert.equal((await planner.send(WAKE_PI_ID, { text: "x", expectsReply: true, wake: good })).code, "E_WAKE_UNSUPPORTED");
+    assert.equal((await planner.send("not-the-pi-id", { text: "x", wake: good })).code, "E_INVALID_WAKE");
+  } finally {
+    raw.socket.destroy();
+    await cleanup();
+  }
+});
+
+test("wake-v1 holds mail within a routing scope and never releases it across scopes", { concurrency: false }, async () => {
+  const { planner: _unscopedPlanner, cleanup } = await setupClients();
+  const alphaSender = new IntercomClient();
+  const betaTarget = new IntercomClient();
+  const alphaTarget = new IntercomClient();
+  try {
+    await withIntercomScope("alpha-wake", () => alphaSender.connect(wakeReg("alpha-wake-sender") as never, "alpha-wake-sender"));
+    assert.equal((await alphaSender.send(WAKE_PI_ID, { messageId: "alpha-wake", text: "alpha only", wake: { piSessionId: WAKE_PI_ID, cwd: repoDir } })).delivery, "queued");
+
+    const beta: Message[] = [];
+    betaTarget.on("message", (_from: SessionInfo, message: Message) => beta.push(message));
+    await withIntercomScope("beta-wake", () => betaTarget.connect(wakeReg("woken", { piSessionId: WAKE_PI_ID }) as never));
+    const unscoped = new IntercomClient();
+    const unscopedReceived = await connectWakeTarget(unscoped, undefined, wakeReg("woken-unscoped", { piSessionId: WAKE_PI_ID }));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(beta.map((m) => m.id), []);
+    assert.deepEqual(unscopedReceived.map((m) => m.id), []);
+    await unscoped.disconnect().catch(() => undefined);
+
+    const alpha: Message[] = [];
+    alphaTarget.on("message", (_from: SessionInfo, message: Message) => alpha.push(message));
+    await withIntercomScope("alpha-wake", () => alphaTarget.connect(wakeReg("woken", { piSessionId: WAKE_PI_ID }) as never));
+    await waitForReplyMessage(alpha, "alpha-wake");
+  } finally {
+    await Promise.all([alphaSender, betaTarget, alphaTarget].map((client) => client.disconnect().catch(() => undefined)));
+    await cleanup();
+  }
+});
+
+test("wake-v1 keeps the broker running while it holds a wake message and exits once it is delivered", { concurrency: false }, async () => {
+  const broker = spawn(process.execPath, [...tsxImportArgs, path.join(repoDir, "broker", "broker.ts")], {
+    cwd: repoDir,
+    env: { ...process.env, HOME: sharedHomeDir, USERPROFILE: sharedHomeDir },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const exited = once(broker, "exit");
+  const sender = new IntercomClient();
+  const target = new IntercomClient();
+  try {
+    await waitForBrokerReady(broker);
+    await sender.connect(wakeReg("wake-idle-sender") as never);
+    assert.equal((await sender.send(WAKE_PI_ID, { messageId: "wake-idle", text: "for later", wake: { piSessionId: WAKE_PI_ID, cwd: repoDir } })).delivery, "queued");
+    await sender.disconnect();
+    await new Promise((resolve) => setTimeout(resolve, 6500));
+    assert.equal(broker.exitCode, null, "a held wake message keeps the broker running");
+
+    const received = await connectWakeTarget(target, undefined, wakeReg("woken", { piSessionId: WAKE_PI_ID }));
+    await waitForReplyMessage(received, "wake-idle");
+    await target.disconnect();
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("broker did not exit when idle")), 8000); });
+    const [code] = await Promise.race([exited, timeout]).finally(() => clearTimeout(timer));
+    assert.equal(code, 0);
+  } finally {
+    await Promise.all([sender, target].map((client) => client.disconnect().catch(() => undefined)));
+    if (broker.exitCode === null && broker.signalCode === null) broker.kill("SIGTERM");
+    await exited.catch(() => undefined);
+  }
+});
+
+test("a client fails a wake send closed against a broker without wake-v1 and still sends normally", { concurrency: false }, async () => {
+  const net = await import("node:net");
+  const { createMessageReader, writeMessage } = await import("./broker/framing.ts");
+  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-old-broker-"));
+  const intercomDir = path.join(agentDir, "intercom");
+  mkdirSync(intercomDir, { recursive: true });
+  const frames: Array<Record<string, unknown>> = [];
+  // A stand-in for a pre-wake broker: advertises only the older features and answers every send as delivered.
+  const server = net.createServer((socket) => {
+    socket.on("data", createMessageReader((raw) => {
+      const frame = raw as Record<string, unknown>;
+      frames.push(frame);
+      if (frame.type === "register") writeMessage(socket, { type: "registered", sessionId: "old-broker-client", features: ["extension-bus-v1", "exact-send-v1"] });
+      if (frame.type === "send") writeMessage(socket, { type: "delivered", messageId: (frame.message as { id: string }).id, delivery: "socket_delivered", retryable: false, outcomeKnown: true });
+      if (frame.type === "list") writeMessage(socket, { type: "sessions", requestId: frame.requestId, sessions: [] });
+    }, () => socket.destroy()));
+  });
+  server.listen(path.join(intercomDir, "broker.sock"));
+  await once(server, "listening");
+  const client = new IntercomClient();
+  try {
+    await withEnv("PI_CODING_AGENT_DIR", agentDir, async () => {
+      await client.connect(wakeReg("new-client-old-broker") as never);
+      assert.equal(client.supportsFeature("wake-v1"), false);
+      const refused = await client.send(WAKE_PI_ID, { messageId: "wake-old-broker", text: "x", wake: { piSessionId: WAKE_PI_ID, cwd: repoDir } });
+      assert.equal(refused.delivered, false);
+      assert.equal(refused.code, "E_WAKE_UNSUPPORTED");
+      assert.match(refused.reason ?? "", /wake-v1/);
+      assert.equal(frames.some((frame) => frame.type === "send"), false, "nothing reached the old broker");
+      const plain = await client.send("some-peer", { messageId: "plain-old-broker", text: "x" });
+      assert.equal(plain.delivered, true);
+    });
+  } finally {
+    await client.disconnect().catch(() => undefined);
+    server.close();
+    rmSync(agentDir, { recursive: true, force: true });
   }
 });
 
