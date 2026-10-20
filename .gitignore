@@ -4,3 +4,13 @@ node_modules/
 
 progress.md
 package-lock.json
+
+# Secrets and local authentication (Session Waker fork)
+.env
+.env.*
+!.env.example
+.secrets/
+*.token
+*.pat
+*.dpapi
+.tmp/
