@@ -42,7 +42,10 @@ cleanup() {
   [ "${KEEP:-}" = 1 ] || { rm -rf "$R"; sleep 1; rm -rf "$R"; }
 }
 trap cleanup EXIT
-clean nohup node "$PIWEB/dist/server/sessiond.js" > "$R/sessiond.log" 2>&1 &
+# exec so that $! is the daemon itself, not a subshell (the cleanup must stop the real process).
+( exec env -i PATH="$PATH" HOME="$R/home" XDG_CONFIG_HOME="$R/home/.config" PI_WEB_DATA_DIR="$R/webdata" \
+    PI_WEB_SESSIOND_SOCKET="$R/sessiond.sock" PI_CODING_AGENT_DIR="$R/agent" WAKER_E2E_ROOT="$R" FAUX_SLOW_MS="${FAUX_SLOW_MS:-10000}" \
+    node "$PIWEB/dist/server/sessiond.js" ) > "$R/sessiond.log" 2>&1 &
 echo $! > "$R/sessiond.pid"
 for i in 1 2 3 4 5 6 7 8 9 10; do [ -S "$R/sessiond.sock" ] && break; sleep 1; done
 echo "isolated root: $R"
