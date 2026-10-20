@@ -1,0 +1,156 @@
+import http from "http";
+import https from "https";
+import type { WakeTarget } from "../types.ts";
+import { SAFE_MESSAGE_ID, WAKE_COMMAND_PROMPT, WakeError, type WakeCandidate, type WakeProvider } from "./provider.ts";
+
+/**
+ * Wake provider for the PI WEB session daemon.
+ *
+ * EXPERIMENTAL: it uses two internal, unsupported routes of the daemon,
+ *   GET  /sessions?cwd=<absolute cwd>          read-only catalog of persisted sessions
+ *   POST /sessions/:sessionId/prompt           opens a saved session and admits a prompt
+ * They can change in any PI WEB release. Every unexpected answer becomes a WakeError (fail closed).
+ * Do not call any other session route to "check" a session: status, messages, and snapshots open it too.
+ * The endpoint is never guessed: it comes from configuration or PI_WEB_SESSIOND_SOCKET / PI_WEB_SESSIOND_URL.
+ */
+export const SESSIOND_PROVIDER_ID = "pi-web-sessiond";
+
+interface Endpoint { socketPath?: string; url?: URL }
+
+function resolveEndpoint(options: { sessiondSocket?: string; sessiondUrl?: string }, env: NodeJS.ProcessEnv): Endpoint {
+  const url = options.sessiondUrl ?? (options.sessiondSocket ? undefined : env.PI_WEB_SESSIOND_URL);
+  if (url) {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new WakeError("unavailable", "The session daemon URL must be http or https");
+    return { url: parsed };
+  }
+  const socketPath = options.sessiondSocket ?? env.PI_WEB_SESSIOND_SOCKET;
+  if (!socketPath) {
+    throw new WakeError("unavailable", "The PI WEB session daemon endpoint is not configured (set PI_WEB_SESSIOND_SOCKET, or wake.sessiondSocket / wake.sessiondUrl in the intercom config).");
+  }
+  return { socketPath };
+}
+
+interface HttpResult { status: number; json: unknown }
+
+const CONNECT_FAILURES = new Set(["ECONNREFUSED", "ENOENT", "EACCES", "EPERM", "ENOTFOUND", "EHOSTUNREACH"]);
+
+export function createSessiondProvider(options: { sessiondSocket?: string; sessiondUrl?: string } = {}, env: NodeJS.ProcessEnv = process.env): WakeProvider {
+  let daemon: string | undefined;
+
+  const request = (method: "GET" | "POST", path: string, body: unknown, timeoutMs: number, signal: AbortSignal | undefined, uncertainOnFailure: boolean): Promise<HttpResult> => new Promise((resolve, reject) => {
+    let endpoint: Endpoint;
+    try {
+      endpoint = resolveEndpoint(options, env);
+    } catch (error) {
+      reject(error instanceof WakeError ? error : new WakeError("unavailable", error instanceof Error ? error.message : String(error)));
+      return;
+    }
+    const payload = body === undefined ? undefined : JSON.stringify(body);
+    const headers: Record<string, string | number> = { accept: "application/json" };
+    if (payload !== undefined) {
+      headers["content-type"] = "application/json";
+      headers["content-length"] = Buffer.byteLength(payload);
+    }
+    const onResponse = (response: http.IncomingMessage) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      response.on("data", (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > 8 * 1024 * 1024) {
+          response.destroy();
+          reject(new WakeError("unsupported", "The session daemon answer is too large"));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        let json: unknown;
+        try { json = text ? JSON.parse(text) : undefined; } catch { json = undefined; }
+        resolve({ status: response.statusCode ?? 0, json });
+      });
+      response.on("error", (error) => reject(failure(error)));
+    };
+    const failure = (error: unknown): WakeError => {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (code && CONNECT_FAILURES.has(code)) return new WakeError("unavailable", `Cannot reach the session daemon (${code})`);
+      if ((error as Error | undefined)?.name === "AbortError") return new WakeError(uncertainOnFailure ? "timeout" : "unavailable", "The session daemon request was aborted or timed out");
+      return uncertainOnFailure
+        ? new WakeError("timeout", `The session daemon request failed after it was sent (${(error as Error | undefined)?.message ?? "unknown"})`)
+        : new WakeError("unavailable", `The session daemon request failed (${(error as Error | undefined)?.message ?? "unknown"})`);
+    };
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const combined = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    const common = { method, headers, signal: combined };
+    try {
+      const req = endpoint.socketPath
+        ? http.request({ ...common, socketPath: endpoint.socketPath, path })
+        : (endpoint.url!.protocol === "https:" ? https : http).request(new URL(path, endpoint.url), common, onResponse);
+      if (endpoint.socketPath) req.on("response", onResponse);
+      req.on("error", (error) => reject(failure(error)));
+      if (payload !== undefined) req.write(payload);
+      req.end();
+    } catch (error) {
+      reject(failure(error));
+    }
+  });
+
+  const errorText = (json: unknown): string => {
+    const text = typeof json === "object" && json !== null && typeof (json as { error?: unknown }).error === "string" ? (json as { error: string }).error : "";
+    return text.slice(0, 200);
+  };
+
+  return {
+    id: SESSIOND_PROVIDER_ID,
+    describe: () => daemon,
+
+    async list(cwd, signal) {
+      const timeoutMs = 30_000; // backstop: the caller bounds the call with its own signal
+      const health = await request("GET", "/health", undefined, timeoutMs, signal, false);
+      const version = (health.json as { version?: { component?: unknown; runtimeVersion?: unknown } } | undefined)?.version;
+      if (health.status !== 200 || (health.json as { ok?: unknown } | undefined)?.ok !== true || version?.component !== "sessiond") {
+        throw new WakeError("unsupported", "The endpoint does not look like a PI WEB session daemon (unexpected /health answer)");
+      }
+      daemon = typeof version.runtimeVersion === "string" ? `sessiond ${version.runtimeVersion}` : "sessiond";
+      const result = await request("GET", `/sessions?cwd=${encodeURIComponent(cwd)}`, undefined, timeoutMs, signal, false);
+      if (result.status === 400) throw new WakeError("rejected", `The session daemon refused the directory: ${errorText(result.json) || "bad request"}`);
+      if (result.status !== 200 || !Array.isArray(result.json)) throw new WakeError("unsupported", `Unexpected catalog answer from the session daemon (HTTP ${result.status})`);
+      const candidates: WakeCandidate[] = [];
+      for (const item of result.json as unknown[]) {
+        if (typeof item !== "object" || item === null) throw new WakeError("unsupported", "Unexpected catalog entry from the session daemon");
+        const entry = item as Record<string, unknown>;
+        if (typeof entry.id !== "string" || !entry.id || typeof entry.cwd !== "string") throw new WakeError("unsupported", "Unexpected catalog entry from the session daemon");
+        candidates.push({
+          piSessionId: entry.id,
+          cwd: entry.cwd,
+          archived: entry.archived === true,
+          ...(typeof entry.name === "string" ? { name: entry.name } : {}),
+          ...(typeof entry.modified === "string" ? { modified: entry.modified } : {}),
+          ...(typeof entry.messageCount === "number" ? { messageCount: entry.messageCount } : {}),
+        });
+      }
+      return candidates;
+    },
+
+    async wake(target: WakeTarget, messageId: string, signal) {
+      if (!SAFE_MESSAGE_ID.test(messageId)) throw new WakeError("rejected", "The message id cannot be carried in a wake command");
+      const result = await request(
+        "POST",
+        `/sessions/${encodeURIComponent(target.piSessionId)}/prompt`,
+        // followUp: if the session is somehow already running, the command queues instead of failing.
+        { cwd: target.cwd, text: WAKE_COMMAND_PROMPT(messageId), streamingBehavior: "followUp" },
+        30_000, // backstop: the caller bounds the call with its own signal
+        signal,
+        true,
+      );
+      if (result.status === 200 && (result.json as { accepted?: unknown } | undefined)?.accepted === true) return;
+      const message = errorText(result.json);
+      if (result.status === 404 || /session not found/i.test(message)) throw new WakeError("not_found", "The session daemon has no such session in that directory");
+      if (/archived/i.test(message)) throw new WakeError("archived", "The session is archived and read-only");
+      if (result.status >= 500) throw new WakeError("server_error", `The session daemon failed while handling the wake (HTTP ${result.status})`);
+      if (result.status === 200) throw new WakeError("unsupported", "Unexpected wake answer from the session daemon");
+      throw new WakeError("rejected", `The session daemon refused the wake (HTTP ${result.status}${message ? `: ${message}` : ""})`);
+    },
+  };
+}

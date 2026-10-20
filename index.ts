@@ -11,6 +11,10 @@ import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
 import { getAskTimeoutMs, getIntercomScopeId, loadConfig, setIntercomScopeId, type IntercomConfig } from "./config.ts";
 import { EXTENSION_BUS_FEATURE } from "./types.ts";
+import "./wake/builtin.ts";
+import { WakeAudit, wakeAuditPath } from "./wake/audit.ts";
+import { findLiveWakeTarget, performWake, type WakeDeps } from "./wake/controller.ts";
+import { SAFE_MESSAGE_ID, WAKE_COMMAND, createWakeProvider } from "./wake/provider.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
 import {
   INTERCOM_EXTENSION_REGISTER_EVENT,
@@ -1975,6 +1979,126 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       };
     }
   }
+  function hasSeenInboundMessageId(messageId: string): boolean {
+    for (const key of seenInboundMessages.keys()) {
+      if (key.endsWith(`\0${messageId}`)) return true;
+    }
+    return false;
+  }
+  function buildWakeDeps(connectedClient: IntercomClient, ctx: ExtensionContext): WakeDeps {
+    const wake = config.wake;
+    return {
+      client: connectedClient,
+      config: wake,
+      provider: createWakeProvider(wake.provider, {
+        ...(wake.sessiondSocket ? { sessiondSocket: wake.sessiondSocket } : {}),
+        ...(wake.sessiondUrl ? { sessiondUrl: wake.sessiondUrl } : {}),
+      }),
+      audit: new WakeAudit(wakeAuditPath(), wake.auditMaxEntries, wake.auditRetentionDays * 24 * 60 * 60 * 1000),
+      ...(ctx.hasUI ? { confirm: (title: string, body: string) => ctx.ui.confirm(title, body) } : {}),
+      self: { intercomId: connectedClient.sessionId, piSessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd },
+    };
+  }
+  /** `send` with wakeIfDisconnected: deliver normally when the target is connected, otherwise hold the message and reopen the session. */
+  async function sendWithWake(
+    connectedClient: IntercomClient,
+    ctx: ExtensionContext,
+    signal: AbortSignal | undefined,
+    request: { to?: string; cwd?: string; openProjectPaneIfMissing?: boolean; message: string; attachments?: Attachment[]; replyTo?: string; supersedes?: string; retryOf?: string },
+  ): Promise<IntercomToolResult> {
+    const fail = (text: string, extra: Record<string, unknown> = {}): IntercomToolResult => ({ content: [{ type: "text", text }], details: { error: true, ...extra } });
+    if (!request.to || !request.cwd) return fail("wakeIfDisconnected needs 'to' (the target's full Pi session id, or an exact name unique in that directory) and the target's 'cwd'.");
+    if (request.openProjectPaneIfMissing || request.replyTo || request.supersedes || request.retryOf) {
+      return fail("wakeIfDisconnected sends a plain new message: it cannot be combined with openProjectPaneIfMissing, replyTo, supersedes, or retryOf.");
+    }
+    if (request.to.includes("@")) return fail("wakeIfDisconnected is not supported for cross-machine targets.");
+    const targetCwd = resolvePath(ctx.cwd, request.cwd);
+    let live: SessionInfo | undefined;
+    try {
+      live = findLiveWakeTarget(await connectedClient.listSessions(), request.to, targetCwd);
+    } catch (error) {
+      return fail(`Failed to list sessions: ${getErrorMessage(error)}`);
+    }
+    if (live) {
+      // Connected: this is an ordinary send and nothing is woken.
+      return deliverMessage(connectedClient, ctx, signal, { to: live.id, message: request.message, attachments: request.attachments });
+    }
+    const result = await performWake(buildWakeDeps(connectedClient, ctx), { to: request.to, cwd: targetCwd, message: request.message, attachments: request.attachments, signal });
+    if (!result.ok) {
+      return fail(result.text, { wake: { outcome: result.outcome, code: result.code }, messageId: result.messageId });
+    }
+    pi.appendEntry("intercom_sent", {
+      to: result.target?.name ?? request.to,
+      message: { text: request.message, attachments: request.attachments },
+      messageId: result.messageId,
+      timestamp: Date.now(),
+      wake: { outcome: result.outcome, piSessionId: result.target?.piSessionId },
+    });
+    const held = result.outcome === "uncertain" || result.outcome === "accepted_unconfirmed";
+    return {
+      content: [{ type: "text", text: result.text }],
+      details: {
+        delivered: true,
+        delivery: held ? "queued" : "socket_delivered",
+        messageId: result.messageId,
+        wake: { outcome: result.outcome, code: result.code, piSessionId: result.target?.piSessionId },
+      },
+    };
+  }
+  /** Internal command run in a reopened session: connect to the broker and let the held message arrive. No model call. */
+  async function runWakeCommand(args: string, ctx: ExtensionContext): Promise<void> {
+    const messageId = args.trim();
+    if (!SAFE_MESSAGE_ID.test(messageId)) {
+      notifyCommand(ctx, `/${WAKE_COMMAND} is an internal command used when another session wakes this one.`, "warning");
+      return;
+    }
+    const generation = runtimeGeneration;
+    const waitMs = config.wake.receiveTimeoutMs;
+    let outcome: "received" | "not_received" | "connect_failed" = "connect_failed";
+    let detail: string | undefined;
+    try {
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Timed out connecting to the intercom broker")), waitMs); });
+      try {
+        await Promise.race([ensureConnected("background"), timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
+      outcome = "not_received";
+      const deadline = Date.now() + waitMs;
+      while (!hasSeenInboundMessageId(messageId) && Date.now() < deadline && getLiveContext(ctx, generation)) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+      }
+      if (hasSeenInboundMessageId(messageId)) outcome = "received";
+    } catch (error) {
+      detail = getErrorMessage(error);
+    }
+    if (getLiveContext(ctx, generation)) {
+      pi.appendEntry("intercom_wake", { messageId, outcome, timestamp: Date.now(), ...(detail ? { detail } : {}) });
+    }
+  }
+  function runWakeStatusCommand(ctx: ExtensionContext): void {
+    const wake = config.wake;
+    const lines = [
+      "**Intercom wake**",
+      `Enabled: ${wake.enabled ? "yes" : "no"}`,
+      `Provider: ${wake.provider}${createWakeProvider(wake.provider, {}) ? "" : " (not available)"}`,
+      `Confirmation: ${wake.confirm}`,
+      `Allowed directories: ${wake.allowCwds.length ? wake.allowCwds.join(", ") : "none"}`,
+      `Broker supports wake-v1: ${client?.supportsFeature("wake-v1") ? "yes" : "no"}`,
+      `Limits: ${wake.perTargetMax} per ${Math.round(wake.perTargetWindowMs / 60_000)} min per session, ${wake.globalMax} per ${Math.round(wake.globalWindowMs / 60_000)} min in total, duplicates refused for ${Math.round(wake.dedupMs / 60_000)} min`,
+    ];
+    try {
+      const recent = new WakeAudit(wakeAuditPath(), wake.auditMaxEntries, wake.auditRetentionDays * 24 * 60 * 60 * 1000).read().filter((entry) => entry.outcome !== "attempting").slice(-5);
+      lines.push(recent.length ? "Recent wakes:" : "Recent wakes: none");
+      for (const entry of recent) {
+        lines.push(`- ${new Date(entry.ts).toISOString()} ${entry.outcome} (${entry.code}) → ${entry.target.piSessionId ?? "?"} in ${entry.target.cwd ?? "?"}`);
+      }
+    } catch (error) {
+      lines.push(`Audit unreadable: ${getErrorMessage(error)}`);
+    }
+    notifyCommand(ctx, lines.join("\n"), "info");
+  }
   async function buildHandoverText(
     connectedClient: IntercomClient,
     ctx: ExtensionContext,
@@ -2597,6 +2721,7 @@ Usage:
   intercom({ action: "list-cwd", cwd: "/path" })  → List sessions in a specific directory
   intercom({ action: "send", to: "name-or-id", message: "..." })  → Send message
   intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
+  intercom({ action: "send", to: "<full session id or unique name>", cwd: "/path", wakeIfDisconnected: true, message: "..." }) → If that persisted session is not connected, hold the message and reopen the session (opt-in, needs user confirmation)
   intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
   intercom({ action: "handover", to: "name-or-id", message: "next task" }) → Summarize this session and hand it over; the receiver acts on it
   intercom({ action: "handover", cwd: "/path", openProjectPaneIfMissing: true }) → Hand over to the session in that project, opening a Herdr pane when needed
@@ -2644,6 +2769,9 @@ Usage:
       focus: Type.Optional(Type.Boolean({
         description: "For openProjectPaneIfMissing, focus the new Herdr pane. Defaults to true.",
       })),
+      wakeIfDisconnected: Type.Optional(Type.Boolean({
+        description: "For 'send' only, with 'to' (the target's full Pi session id, or an exact name unique in 'cwd') and the target's absolute 'cwd': if the target is a persisted session that is not connected, hold the message and reopen that session so it receives it. Disabled unless wake.enabled is set; asks the user first; never for a connected target, an ask, a reply, or the current session.",
+      })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -2659,7 +2787,13 @@ Usage:
 
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
-      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus } = params;
+      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, wakeIfDisconnected } = params;
+      if (wakeIfDisconnected && action !== "send") {
+        return {
+          content: [{ type: "text", text: "wakeIfDisconnected is only supported by the 'send' action." }],
+          details: { error: true },
+        };
+      }
 
       switch (action) {
         case "list": {
@@ -2782,6 +2916,9 @@ Usage:
               content: [{ type: "text", text: "Missing 'to' or 'cwd', or missing 'message' parameter" }],
               details: { error: true },
             };
+          }
+          if (wakeIfDisconnected) {
+            return sendWithWake(connectedClient, ctx, _signal, { to, cwd, openProjectPaneIfMissing, message, attachments, replyTo, supersedes, retryOf });
           }
           return deliverMessage(connectedClient, ctx, _signal, {
             to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf,
@@ -3408,6 +3545,18 @@ Usage:
   pi.registerCommand("alias", {
     description: "Set the current session alias (usage: /alias <name> or /alias menu)",
     handler: async (args, ctx) => setIntercomAlias(args, ctx),
+  });
+
+  // Registered unconditionally, even when intercom or wake is disabled, so a woken session always consumes the wake
+  // prompt as a command instead of handing "/intercom-wake ..." to the model.
+  pi.registerCommand(WAKE_COMMAND, {
+    description: "Internal: run in a session that another session woke, to receive its held intercom message (no model call)",
+    handler: async (args, ctx) => runWakeCommand(args, ctx),
+  });
+
+  pi.registerCommand("intercom-wake-status", {
+    description: "Show the intercom wake settings, whether the broker supports it, and the most recent wake attempts",
+    handler: async (_args, ctx) => runWakeStatusCommand(ctx),
   });
 
   pi.registerCommand("handover", {

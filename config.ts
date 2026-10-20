@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { hostname } from "os";
+import { isAbsolute } from "path";
 import { getIntercomDirPath } from "./broker/paths.ts";
 import { defaultMachineName } from "./cross-machine-envelope.ts";
 
@@ -41,6 +42,36 @@ export interface CrossMachineConfig {
   remoteCommand: string;
 }
 
+export interface WakeConfig {
+  /** Master switch. Off by default: waking loads a persisted session and runs its extensions. */
+  enabled: boolean;
+  /** Registered wake provider id; `pi-web-sessiond` is the only built-in. */
+  provider: string;
+  /** Absolute directories whose sessions may be woken. Empty means none. */
+  allowCwds: string[];
+  /** `always` asks the user before every wake (and blocks without UI); `never` skips the dialog for allowlisted directories. */
+  confirm: "always" | "never";
+  /** A wake with the same target and text inside this window is refused. */
+  dedupMs: number;
+  perTargetMax: number;
+  perTargetWindowMs: number;
+  globalMax: number;
+  globalWindowMs: number;
+  /** Time allowed for the daemon catalog read. */
+  listTimeoutMs: number;
+  /** Time allowed for the daemon to accept the wake prompt. */
+  wakeTimeoutMs: number;
+  /** Time to wait for the woken session's receipt before reporting the delivery as unconfirmed. */
+  deliveryTimeoutMs: number;
+  /** Time `/intercom-wake` waits, inside the woken session, for the held message to arrive. */
+  receiveTimeoutMs: number;
+  auditMaxEntries: number;
+  auditRetentionDays: number;
+  /** Explicit endpoint of the PI WEB session daemon; falls back to PI_WEB_SESSIOND_SOCKET / PI_WEB_SESSIOND_URL. Never guessed. */
+  sessiondSocket?: string;
+  sessiondUrl?: string;
+}
+
 export interface IntercomConfig {
   /** Broker command used to spawn the broker process (e.g. "npx" or "bun") */
   brokerCommand: string;
@@ -71,6 +102,75 @@ export interface IntercomConfig {
 
   /** Cross-machine discovery and SSH relay settings. */
   crossMachine: CrossMachineConfig;
+
+  /** Opt-in wake of persisted but unloaded sessions (see docs/session-waker). */
+  wake: WakeConfig;
+}
+
+export const defaultWakeConfig = (): WakeConfig => ({
+  enabled: false,
+  provider: "pi-web-sessiond",
+  allowCwds: [],
+  confirm: "always",
+  dedupMs: 10 * 60_000,
+  perTargetMax: 3,
+  perTargetWindowMs: 10 * 60_000,
+  globalMax: 10,
+  globalWindowMs: 60 * 60_000,
+  listTimeoutMs: 5_000,
+  wakeTimeoutMs: 15_000,
+  deliveryTimeoutMs: 30_000,
+  receiveTimeoutMs: 15_000,
+  auditMaxEntries: 1000,
+  auditRetentionDays: 30,
+});
+
+function parseWakeConfig(value: unknown): WakeConfig {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`"wake" must be an object`);
+  }
+  const raw = value as Record<string, unknown>;
+  const wake = defaultWakeConfig();
+  const known = new Set<string>(Object.keys(wake).concat(["sessiondSocket", "sessiondUrl"]));
+  for (const key of Object.keys(raw)) {
+    if (!known.has(key)) throw new Error(`"wake.${key}" is not a known setting`);
+  }
+  const bool = (key: "enabled") => {
+    if (Object.hasOwn(raw, key)) {
+      if (typeof raw[key] !== "boolean") throw new Error(`"wake.${key}" must be a boolean`);
+      wake[key] = raw[key] as boolean;
+    }
+  };
+  const positive = (key: "dedupMs" | "perTargetMax" | "perTargetWindowMs" | "globalMax" | "globalWindowMs" | "listTimeoutMs" | "wakeTimeoutMs" | "deliveryTimeoutMs" | "receiveTimeoutMs" | "auditMaxEntries" | "auditRetentionDays") => {
+    if (Object.hasOwn(raw, key)) {
+      const n = raw[key];
+      if (typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0) throw new Error(`"wake.${key}" must be a positive integer`);
+      wake[key] = n;
+    }
+  };
+  bool("enabled");
+  if (Object.hasOwn(raw, "provider")) {
+    if (typeof raw.provider !== "string" || !raw.provider.trim()) throw new Error(`"wake.provider" must be a non-empty string`);
+    wake.provider = raw.provider.trim();
+  }
+  if (Object.hasOwn(raw, "allowCwds")) {
+    if (!Array.isArray(raw.allowCwds) || !raw.allowCwds.every((cwd) => typeof cwd === "string" && isAbsolute(cwd))) {
+      throw new Error(`"wake.allowCwds" must be an array of absolute directory paths`);
+    }
+    wake.allowCwds = raw.allowCwds as string[];
+  }
+  if (Object.hasOwn(raw, "confirm")) {
+    if (raw.confirm !== "always" && raw.confirm !== "never") throw new Error(`"wake.confirm" must be "always" or "never"`);
+    wake.confirm = raw.confirm;
+  }
+  for (const key of ["dedupMs", "perTargetMax", "perTargetWindowMs", "globalMax", "globalWindowMs", "listTimeoutMs", "wakeTimeoutMs", "deliveryTimeoutMs", "receiveTimeoutMs", "auditMaxEntries", "auditRetentionDays"] as const) positive(key);
+  for (const key of ["sessiondSocket", "sessiondUrl"] as const) {
+    if (Object.hasOwn(raw, key)) {
+      if (typeof raw[key] !== "string" || !(raw[key] as string).trim()) throw new Error(`"wake.${key}" must be a non-empty string`);
+      wake[key] = (raw[key] as string).trim();
+    }
+  }
+  return wake;
 }
 
 export function getConfigPath(intercomDir: string = getIntercomDirPath()): string {
@@ -89,12 +189,13 @@ const defaults: IntercomConfig = {
     machineName: defaultMachineName(hostname()),
     remoteCommand: "pi-intercom",
   },
+  wake: defaultWakeConfig(),
 };
 
 export function loadConfig(): IntercomConfig {
   const configPath = getConfigPath();
   if (!existsSync(configPath)) {
-    return { ...defaults, crossMachine: { ...defaults.crossMachine } };
+    return { ...defaults, crossMachine: { ...defaults.crossMachine }, wake: defaultWakeConfig() };
   }
   
   try {
@@ -108,7 +209,12 @@ export function loadConfig(): IntercomConfig {
     const config: IntercomConfig = {
       ...defaults,
       crossMachine: { ...defaults.crossMachine },
+      wake: defaultWakeConfig(),
     };
+
+    if (Object.hasOwn(parsedConfig, "wake")) {
+      config.wake = parseWakeConfig(parsedConfig.wake);
+    }
 
     if (Object.hasOwn(parsedConfig, "brokerCommand")) {
       if (typeof parsedConfig.brokerCommand !== "string") {

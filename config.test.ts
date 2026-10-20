@@ -162,3 +162,54 @@ test("loadConfig rejects invalid busyDelivery values", async () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("loadConfig leaves waking persisted sessions off, confirmed, and empty by default", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    await withAgentDir(root, () => {
+      const wake = loadConfig().wake;
+      assert.equal(wake.enabled, false);
+      assert.equal(wake.confirm, "always");
+      assert.deepEqual(wake.allowCwds, []);
+      assert.equal(wake.provider, "pi-web-sessiond");
+      assert.equal(wake.perTargetMax, 3);
+      assert.equal(wake.globalMax, 10);
+      assert.equal(wake.dedupMs, 10 * 60_000);
+      assert.equal(wake.auditRetentionDays, 30);
+      assert.equal(wake.auditMaxEntries, 1000);
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig reads wake settings and rejects unknown or invalid ones", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    mkdirSync(join(root, "intercom"), { recursive: true });
+    const write = (wake: unknown) => writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ wake }));
+    await withAgentDir(root, () => {
+      write({ enabled: true, allowCwds: ["/work/a", "/work/b"], confirm: "never", perTargetMax: 5, sessiondSocket: "/run/pi-web/sessiond.sock" });
+      const wake = loadConfig().wake;
+      assert.deepEqual([wake.enabled, wake.confirm, wake.perTargetMax, wake.sessiondSocket], [true, "never", 5, "/run/pi-web/sessiond.sock"]);
+      assert.deepEqual(wake.allowCwds, ["/work/a", "/work/b"]);
+      for (const [bad, message] of [
+        [{ enabled: "yes" }, /"wake.enabled" must be a boolean/],
+        [{ allowCwds: ["relative"] }, /"wake.allowCwds" must be an array of absolute/],
+        [{ allowCwds: "/work" }, /"wake.allowCwds" must be an array of absolute/],
+        [{ confirm: "sometimes" }, /"wake.confirm" must be "always" or "never"/],
+        [{ dedupMs: 0 }, /"wake.dedupMs" must be a positive integer/],
+        [{ globalMax: 1.5 }, /"wake.globalMax" must be a positive integer/],
+        [{ provider: " " }, /"wake.provider" must be a non-empty string/],
+        [{ sessiondUrl: "" }, /"wake.sessiondUrl" must be a non-empty string/],
+        [{ autoWake: true }, /"wake.autoWake" is not a known setting/],
+        ["on", /"wake" must be an object/],
+      ] as const) {
+        write(bad);
+        assert.throws(() => loadConfig(), message);
+      }
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

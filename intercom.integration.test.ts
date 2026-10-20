@@ -2286,6 +2286,228 @@ test("a client fails a wake send closed against a broker without wake-v1 and sti
   }
 });
 
+// ---- wake: the extension side (tool option, internal command, status) against a real broker and a fake provider ----
+
+const WAKE_TARGET_PI_ID = "0198b0b0-cccc-7ddd-8eee-ffff00001111";
+
+async function withWake<T>(overrides: Record<string, unknown>, fn: (ctl: {
+  planner: InstanceType<typeof IntercomClient>;
+  sender: ReturnType<typeof createExtensionHarness>;
+  target: ReturnType<typeof createExtensionHarness>;
+  wakeCalls: string[];
+  confirmations: string[];
+  notices: string[];
+  setProvider: (wake: (messageId: string, open: () => Promise<void>) => Promise<void>, catalog?: Array<Record<string, unknown>>) => void;
+  openTarget: () => Promise<void>;
+  runWakeCommand: (messageId: string) => Promise<void>;
+  tool: (params: Record<string, unknown>) => Promise<CapturedToolResult>;
+  audit: () => Array<Record<string, unknown>>;
+}) => Promise<T>, options: { confirm?: boolean; senderHasUi?: boolean; withConfig?: boolean } = {}): Promise<T> {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { registerWakeProvider } = await import("./wake/provider.ts");
+  const { wakeAuditPath } = await import("./wake/audit.ts");
+  const { planner, cleanup } = await setupClients();
+  rmSync(wakeAuditPath(), { force: true });
+  const wakeCalls: string[] = [];
+  const confirmations: string[] = [];
+  const notices: string[] = [];
+  let catalog: Array<Record<string, unknown>> = [{ piSessionId: WAKE_TARGET_PI_ID, cwd: repoDir, name: "wake-target", archived: false }];
+  let wake: (messageId: string, open: () => Promise<void>) => Promise<void> = async (_id, open) => { await open(); };
+  const previousStable = process.env.PI_INTERCOM_STABLE_ID;
+  delete process.env.PI_INTERCOM_STABLE_ID;
+  const config = { wake: { enabled: true, provider: "fake-wake", allowCwds: [repoDir], deliveryTimeoutMs: 4000, receiveTimeoutMs: 1500, ...overrides } };
+  const run = async () => {
+    const sender = createExtensionHarness("wake-sender", {
+      hasUI: options.senderHasUi !== false,
+      sessionId: "wake-sender-pi-id",
+      ui: { confirm: async (_title: string, body: string) => { confirmations.push(body); return options.confirm !== false; }, notify: (message: string) => { notices.push(message); } },
+    });
+    const target = createExtensionHarness("wake-target", { hasUI: true, isIdle: () => true, sessionId: WAKE_TARGET_PI_ID, ui: { notify: (message: string) => { notices.push(message); } } });
+    registerWakeProvider("fake-wake", () => ({
+      id: "fake-wake",
+      describe: () => "fake 1",
+      list: async (cwd) => catalog.filter((entry) => entry.cwd === cwd) as never,
+      wake: async (_target, messageId) => {
+        wakeCalls.push(messageId);
+        // What the session daemon does: open the saved session, then run the prompt it was given.
+        await wake(messageId, async () => { await target.emitLifecycle("session_start"); void target.commands.get("intercom-wake")!(messageId, target.ctx); });
+      },
+    }));
+    try {
+      piIntercomExtension(sender.pi as never);
+      piIntercomExtension(target.pi as never);
+      await sender.emitLifecycle("session_start");
+      await waitForSessionByName(planner, "wake-sender");
+      const tool = sender.tools.find((candidate) => candidate.name === "intercom")!;
+      return await fn({
+        planner, sender, target, wakeCalls, confirmations, notices,
+        setProvider: (next, nextCatalog) => { wake = next; if (nextCatalog) catalog = nextCatalog; },
+        openTarget: async () => { await target.emitLifecycle("session_start"); },
+        runWakeCommand: async (messageId) => { await target.commands.get("intercom-wake")!(messageId, target.ctx); },
+        tool: (params) => tool.execute("wake-tool", params, new AbortController().signal, undefined, sender.ctx),
+        audit: () => existsSync(wakeAuditPath()) ? readFileSync(wakeAuditPath(), "utf-8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>) : [],
+      });
+    } finally {
+      await target.emitLifecycle("session_shutdown");
+      await sender.emitLifecycle("session_shutdown");
+    }
+  };
+  try {
+    return await (options.withConfig === false ? run() : withIntercomConfig(config, run));
+  } finally {
+    if (previousStable === undefined) delete process.env.PI_INTERCOM_STABLE_ID;
+    else process.env.PI_INTERCOM_STABLE_ID = previousStable;
+    await cleanup();
+  }
+}
+const wakeParams = (over: Record<string, unknown> = {}) => ({ action: "send", to: WAKE_TARGET_PI_ID, cwd: repoDir, wakeIfDisconnected: true, message: "Please review the open branch", ...over });
+
+test("send with wakeIfDisconnected holds the message, reopens the dormant session, and delivers it exactly once with one model turn", { concurrency: false }, async () => {
+  await withWake({}, async (ctl) => {
+    const result = await ctl.tool(wakeParams());
+    assert.notEqual(result.details?.error, true, result.content[0]?.text);
+    assert.equal((result.details?.wake as { outcome: string }).outcome, "delivered");
+    assert.equal(ctl.wakeCalls.length, 1);
+    assert.equal(ctl.confirmations.length, 1);
+    assert.match(ctl.confirmations[0]!, /wake-target/);
+    // The woken session received the intercom message once and ran exactly one wake prompt: the normal intercom one.
+    await waitForCondition(() => ctl.target.sentMessages.length === 1, "message injected into the woken session");
+    assert.equal(ctl.target.sentMessages[0]!.message.customType, "intercom_message");
+    assert.match(String(ctl.target.sentMessages[0]!.message.content), /Please review the open branch/);
+    assert.deepEqual(ctl.target.userMessages, ["New intercom message above."], "the wake prompt itself never reaches the model");
+    await waitForCondition(() => ctl.target.entries.some((entry) => entry.type === "intercom_wake"), "the wake command's record");
+    assert.deepEqual(ctl.target.entries.filter((entry) => entry.type === "intercom_wake").map((entry) => (entry.data as { outcome: string }).outcome), ["received"]);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(ctl.target.sentMessages.length, 1, "still once");
+    const audit = ctl.audit();
+    assert.deepEqual(audit.map((entry) => entry.outcome), ["attempting", "delivered"]);
+    assert.equal(JSON.stringify(audit).includes("open branch"), false);
+    assert.equal(ctl.sender.entries.some((entry) => entry.type === "intercom_sent" && (entry.data as { wake?: unknown }).wake !== undefined), true);
+  });
+});
+
+test("send with wakeIfDisconnected to a connected session is an ordinary send: nothing is woken and nothing is audited", { concurrency: false }, async () => {
+  await withWake({}, async (ctl) => {
+    await ctl.openTarget();
+    await waitForSessionByName(ctl.planner, "wake-target");
+    const result = await ctl.tool(wakeParams());
+    assert.notEqual(result.details?.error, true, result.content[0]?.text);
+    await waitForCondition(() => ctl.target.sentMessages.length === 1, "ordinary delivery");
+    assert.equal(ctl.wakeCalls.length, 0);
+    assert.equal(ctl.confirmations.length, 0);
+    assert.deepEqual(ctl.audit(), []);
+  });
+});
+
+test("waking is off by default: the tool refuses, holds nothing, and a later reconnect receives nothing", { concurrency: false }, async () => {
+  await withWake({}, async (ctl) => {
+    const result = await ctl.tool(wakeParams());
+    assert.equal(result.details?.error, true);
+    assert.match(result.content[0]!.text, /disabled/);
+    assert.equal(ctl.wakeCalls.length, 0);
+    await ctl.openTarget();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(ctl.target.sentMessages.length, 0);
+  }, { withConfig: false });
+});
+
+test("a declined confirmation, a missing UI, or a directory outside the allowlist wake nothing and hold nothing", { concurrency: false }, async () => {
+  await withWake({}, async (ctl) => {
+    const declined = await ctl.tool(wakeParams());
+    assert.equal(declined.details?.error, true);
+    assert.match(declined.content[0]!.text, /cancelled/i);
+    await ctl.openTarget();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual([ctl.wakeCalls.length, ctl.target.sentMessages.length], [0, 0]);
+  }, { confirm: false });
+  await withWake({}, async (ctl) => {
+    const noUi = await ctl.tool(wakeParams());
+    assert.equal(noUi.details?.error, true);
+    assert.match(noUi.content[0]!.text, /confirmation/i);
+    assert.equal(ctl.wakeCalls.length, 0);
+  }, { senderHasUi: false });
+  await withWake({ allowCwds: ["/somewhere/else"] }, async (ctl) => {
+    const outside = await ctl.tool(wakeParams());
+    assert.equal(outside.details?.error, true);
+    assert.match(outside.content[0]!.text, /allowCwds/);
+    assert.equal(ctl.wakeCalls.length, 0);
+  });
+});
+
+test("when the daemon refuses the wake, the held message is withdrawn so a later reconnect receives nothing", { concurrency: false }, async () => {
+  await withWake({}, async (ctl) => {
+    const { WakeError } = await import("./wake/provider.ts");
+    ctl.setProvider(async () => { throw new WakeError("archived", "The session is archived and read-only"); });
+    const result = await ctl.tool(wakeParams());
+    assert.equal(result.details?.error, true);
+    assert.match(result.content[0]!.text, /archived/);
+    assert.match(result.content[0]!.text, /withdrawn/);
+    await ctl.openTarget();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(ctl.target.sentMessages.length, 0, "the withdrawn message is not delivered later");
+    assert.deepEqual(ctl.audit().map((entry) => entry.outcome), ["attempting", "failed"]);
+  });
+});
+
+test("the same message twice is refused as a duplicate and only one is ever held", { concurrency: false }, async () => {
+  await withWake({}, async (ctl) => {
+    ctl.setProvider(async () => undefined); // accepted, but the session never opens: it stays dormant
+    const first = await ctl.tool(wakeParams({ message: "Same text" }));
+    assert.equal((first.details?.wake as { outcome: string }).outcome, "accepted_unconfirmed");
+    const again = await ctl.tool(wakeParams({ message: "Same text" }));
+    assert.equal(again.details?.error, true);
+    assert.match(again.content[0]!.text, /already sent/);
+    assert.equal(ctl.wakeCalls.length, 1);
+    // Exactly one copy is waiting: when the session finally opens it receives it once.
+    await ctl.openTarget();
+    await waitForCondition(() => ctl.target.sentMessages.length === 1, "the one held message");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(ctl.target.sentMessages.length, 1);
+  });
+});
+
+test("wakeIfDisconnected is refused for asks, replies, and calls that name no directory", { concurrency: false }, async () => {
+  await withWake({}, async (ctl) => {
+    const ask = await ctl.tool({ ...wakeParams(), action: "ask" });
+    assert.match(ask.content[0]!.text, /only supported by the 'send' action/);
+    const noCwd = await ctl.tool(wakeParams({ cwd: undefined }));
+    assert.match(noCwd.content[0]!.text, /needs 'to'.*'cwd'/s);
+    const reply = await ctl.tool(wakeParams({ replyTo: "x" }));
+    assert.match(reply.content[0]!.text, /plain new message/);
+    assert.equal(ctl.wakeCalls.length, 0);
+  });
+});
+
+test("/intercom-wake is registered even when wake is disabled and consumes its prompt without a model call", { concurrency: false }, async () => {
+  await withWake({}, async (ctl) => {
+    assert.equal(typeof ctl.target.commands.get("intercom-wake"), "function");
+    await ctl.openTarget();
+    await ctl.runWakeCommand("no-such-message");
+    const entries = ctl.target.entries.filter((entry) => entry.type === "intercom_wake").map((entry) => entry.data as { messageId: string; outcome: string });
+    assert.deepEqual(entries.map((entry) => [entry.messageId, entry.outcome]), [["no-such-message", "not_received"]]);
+    assert.deepEqual(ctl.target.userMessages, []);
+    assert.equal(ctl.target.sentMessages.length, 0);
+    // A malformed argument is ignored with a notice instead of being run.
+    await ctl.runWakeCommand("x y; rm");
+    assert.equal(ctl.target.entries.filter((entry) => entry.type === "intercom_wake").length, 1);
+    assert.ok(ctl.notices.some((notice) => /internal command/.test(notice)));
+  }, { withConfig: false });
+});
+
+test("/intercom-wake-status reports the settings and the recent attempts without their text", { concurrency: false }, async () => {
+  await withWake({}, async (ctl) => {
+    await ctl.tool(wakeParams());
+    await ctl.sender.commands.get("intercom-wake-status")!("", ctl.sender.ctx);
+    const status = ctl.notices.find((notice) => notice.startsWith("**Intercom wake**"))!;
+    assert.match(status, /Enabled: yes/);
+    assert.match(status, /Confirmation: always/);
+    assert.match(status, new RegExp(repoDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(status, /Broker supports wake-v1: yes/);
+    assert.match(status, /delivered \(delivered\)/);
+    assert.equal(status.includes("open branch"), false);
+  });
+});
+
 test("a session identity claim sets the intercom id and keeps the readable session name", { concurrency: false }, async () => {
   const { planner, cleanup } = await setupClients();
   const { default: piIntercomExtension } = await import("./index.ts");
