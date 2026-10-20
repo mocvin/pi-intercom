@@ -524,7 +524,7 @@ This feature ships in a fork of pi-intercom published as the package **`pi-inter
 pi remove npm:pi-intercom
 pi install npm:pi-intercom-wake                                   # from npm
 # or, pinned to a release tag, straight from GitHub:
-pi install git:github.com/mocvin/pi-intercom@v0.17.1-wake.1
+pi install git:github.com/mocvin/pi-intercom@v0.17.1-wake.2
 ```
 
 Then restart the intercom broker once (it is a long-lived process that keeps running the old code) and `/reload` the sessions; see [`docs/session-waker/INSTALL.md`](docs/session-waker/INSTALL.md). Sessions that still run the original pi-intercom keep working with this broker, and the other way round. To go back, remove `pi-intercom-wake`, install `npm:pi-intercom` again, and restart the broker.
