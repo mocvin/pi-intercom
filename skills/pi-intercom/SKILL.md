@@ -267,6 +267,13 @@ only when a long-lived visible peer session is useful.
 If Herdr is unavailable, do not invent a terminal fallback inside this workflow.
 Ask the user before opening another visible surface manually.
 
+## Waking a Persisted Session
+
+A saved session that is not loaded is not in the roster. When the user wants a message delivered to one anyway, use
+`intercom({ action: "send", to: "<full session id or exact unique name>", cwd: "/abs/cwd", wakeIfDisconnected: true, message: "..." })`.
+It only works when `wake.enabled` is set, asks the user to confirm, and never applies to a connected target, an `ask`, a reply, or yourself.
+If the result says the outcome is unconfirmed or unknown, the message is still held: do not resend it. Never put secrets in the message.
+
 ## Important Constraints
 
 ### `ask` Limitations

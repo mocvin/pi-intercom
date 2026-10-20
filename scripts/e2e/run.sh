@@ -1,0 +1,35 @@
+#!/bin/sh
+# End-to-end wake check on an ISOLATED PI WEB session daemon + intercom broker. Never touches the live ones:
+# everything lives under a throwaway /tmp/waker-e2e-* directory and only processes started here are stopped here.
+set -eu
+HERE=$(cd "$(dirname "$0")/../.." && pwd)
+PIWEB=${PIWEB:-$(npm root -g)/@jmfederico/pi-web}
+R=$(mktemp -d /tmp/waker-e2e-XXXX)
+mkdir -p "$R/home" "$R/agent/intercom" "$R/webdata" "$R/work"
+printf '{"packages":["%s"]}\n' "$HERE" > "$R/agent/settings.json"
+clean() {
+  env -i PATH="$PATH" HOME="$R/home" XDG_CONFIG_HOME="$R/home/.config" PI_WEB_DATA_DIR="$R/webdata" \
+    PI_WEB_SESSIOND_SOCKET="$R/sessiond.sock" PI_CODING_AGENT_DIR="$R/agent" WAKER_E2E_ROOT="$R" "$@"
+}
+cleanup() {
+  # Only the isolated broker (pid file in the throwaway agent dir) and the daemon started below.
+  [ -f "$R/agent/intercom/broker.pid" ] && kill "$(cat "$R/agent/intercom/broker.pid")" 2>/dev/null || true
+  [ -f "$R/sessiond.pid" ] && kill "$(cat "$R/sessiond.pid")" 2>/dev/null || true
+  for i in 1 2 3 4 5 6 7 8; do
+    alive=0
+    for f in "$R/agent/intercom/broker.pid" "$R/sessiond.pid"; do
+      [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && alive=1
+    done
+    [ "$alive" = 0 ] && break
+    sleep 1
+  done
+  # Set KEEP=1 to keep the throwaway directory (logs, audit, session files) for inspection.
+  [ "${KEEP:-}" = 1 ] || rm -rf "$R"
+}
+trap cleanup EXIT
+clean nohup node "$PIWEB/dist/server/sessiond.js" > "$R/sessiond.log" 2>&1 &
+echo $! > "$R/sessiond.pid"
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -S "$R/sessiond.sock" ] && break; sleep 1; done
+echo "isolated root: $R"
+cd "$HERE"
+clean node_modules/.bin/tsx scripts/e2e/wake-e2e.ts

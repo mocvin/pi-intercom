@@ -417,6 +417,8 @@ Only registered in sessions where `pi-subagents` supplied the required child bri
 
 **`send`** — Sends a message to the specified session and returns immediately after delivery. If the destination has exactly one pending inbound ask, `send` infers the message is its answer and returns `Reply sent to <target> (inferred from pending ask)`. During a turn triggered by an inbound ask, a non-reply `send` to a different target is rejected so a guessed parent/root CWD cannot receive an accidental reply. Zero or multiple pending-ask matches remain unthreaded sends outside the active ask turn. Set `confirmSend: true` to confirm ordinary and inferred sends. A caller-supplied `replyTo` skips confirmation. `to` alone resolves globally across all live sessions. `cwd` alone targets the sole live peer in that directory. `to` plus `cwd` requires that peer to be in the directory. With `openProjectPaneIfMissing: true`, pi-intercom opens a visible Herdr project pane, starts Pi there, waits for that session to register, then delivers the message through normal intercom routing.
 
+With `wakeIfDisconnected: true` (plus `to` and the target's `cwd`), `send` can also reach a *persisted* session that is not connected: see [Waking persisted sessions](#waking-persisted-sessions).
+
 **`ask`** — Requires a currently connected recipient, sends a message, and waits for the recipient to reply (10-minute timeout by default; configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`). A disconnected target fails immediately rather than queueing a blocking request. The reply is returned as the tool result. No confirmation dialog. Only one pending `ask` is allowed per session at a time. Use this when the agent needs the answer to continue working. The same `to`, `cwd`, and `openProjectPaneIfMissing` targeting rules apply.
 
 **`handover`** — Summarizes the current session with the current model and sends the summary to the target, which acts on it. `message` is the optional next task. Targeting, confirmation, and delivery work exactly like `send`, including `name@machine` targets. `replyTo`, `supersedes`, `retryOf`, and `attachments` are rejected. See [Workflow: Handing Over a Session](#workflow-handing-over-a-session).
@@ -494,6 +496,55 @@ Set `PI_INTERCOM_SCOPE_ID` before starting Pi to opt a session into an opaque br
 By default, runtime state and config live under `~/.pi/agent/intercom`. If Pi is launched with `PI_CODING_AGENT_DIR`, pi-intercom uses `$PI_CODING_AGENT_DIR/intercom` instead, including `config.json`, broker PID/lock files, sockets, and launcher state.
 
 The broker also runs from this runtime directory so its working directory does not lock the installed package against updates on Windows. Custom broker commands can use executables on `PATH` or absolute paths; relative file paths in commands and arguments resolve from the runtime directory.
+
+## Waking persisted sessions
+
+A persisted Pi session that is not loaded (for example in PI WEB) is not connected to the broker, so nothing can reach it. With `wakeIfDisconnected: true`, `send` holds the message for it and reopens that very session:
+
+```
+intercom({ action: "send", to: "<full Pi session id, or an exact name unique in cwd>", cwd: "/abs/path/of/the/session",
+           wakeIfDisconnected: true, message: "..." })
+```
+
+1. If the target is connected, this is an ordinary send. Nothing is woken.
+2. Otherwise the target is looked up in the host's read-only catalog of persisted sessions. It must be exact: a full Pi session id, or a name that is exact and unique in `cwd`. Prefixes never match. Archived, ambiguous, missing, and the current session are refused.
+3. After the policy checks and the user's confirmation, the broker holds the message **once** in its mailbox, addressed to that Pi session id and directory (feature `wake-v1`, delivery `queued`, code `wake_pending`).
+4. The provider asks the host to reopen the session and run the internal command `/intercom-wake <messageId>`. Pi runs extension commands before the model, so the command makes **no model call**. It connects to the broker and lets the held message arrive.
+5. The message is delivered through the normal intercom path (receipts, duplicate suppression, the shared idle wake), so the woken session takes one model turn, caused by the message. The sender waits for the receipt and reports `delivered`, or says plainly that the outcome is unconfirmed or unknown and that the message stays held for up to 24 hours (do not resend it).
+
+If the host refuses the wake (not found, archived, rejected), the held message is withdrawn. If its answer is unknown (timeout, server error), the message stays held.
+
+It is **off by default** and fail-closed. Settings under `wake` in `config.json`:
+
+```json
+{
+  "wake": {
+    "enabled": true,
+    "allowCwds": ["/home/me/projects/app"],
+    "confirm": "always",
+    "provider": "pi-web-sessiond"
+  }
+}
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `wake.enabled` | false | Master switch. Waking loads a session and runs its extensions. |
+| `wake.allowCwds` | `[]` | Absolute directories whose sessions may be woken. Empty allows none. |
+| `wake.confirm` | `"always"` | `"always"` asks the user before every wake and blocks when there is no UI. `"never"` skips the dialog for allowlisted directories. |
+| `wake.provider` | `"pi-web-sessiond"` | Registered provider id. |
+| `wake.sessiondSocket` / `wake.sessiondUrl` | — | Endpoint of the PI WEB session daemon. Otherwise `PI_WEB_SESSIOND_SOCKET` / `PI_WEB_SESSIOND_URL` is used. The endpoint is never guessed. |
+| `wake.dedupMs` | 600000 | An identical message to the same session inside this window is refused. |
+| `wake.perTargetMax` / `wake.perTargetWindowMs` | 3 / 600000 | Wakes allowed per session per window. |
+| `wake.globalMax` / `wake.globalWindowMs` | 10 / 3600000 | Wakes allowed in total per window, across all sessions of the user. |
+| `wake.listTimeoutMs` / `wake.wakeTimeoutMs` | 5000 / 15000 | Time allowed for the catalog read and for the host to accept the wake. |
+| `wake.deliveryTimeoutMs` | 30000 | How long the sender waits for the woken session's receipt. |
+| `wake.receiveTimeoutMs` | 15000 | How long `/intercom-wake` waits inside the woken session for the held message. |
+| `wake.auditMaxEntries` / `wake.auditRetentionDays` | 1000 / 30 | Bounds of the audit file. |
+
+Messages that look like secrets (tokens, private keys, passwords) or exceed 32 KiB are refused. Every attempt is recorded in `wake-audit.jsonl` next to `config.json` (mode 0600): time, outcome, ids, directory, text length and SHA-256, never the text. The duplicate window and the rate limits are computed from that file, so they hold across all sessions. If the audit cannot be written, nothing is woken. `/intercom-wake-status` shows the settings, whether the broker supports `wake-v1`, and recent attempts.
+
+Limits: plain `send` only (no `ask`, `reply`, `supersede`, or cross-machine target). The held message lives in the broker's memory, so a broker restart loses it. The sender and the woken session must share a routing scope (`PI_INTERCOM_SCOPE_ID`). The built-in provider talks to the PI WEB session daemon through two **internal, unsupported** routes (`GET /sessions?cwd=` and `POST /sessions/:id/prompt`) that can change in any PI WEB release; every unexpected answer is refused. A broker started before upgrading keeps running its old code, so wake needs a broker restart (sessions reconnect on their own). See `docs/session-waker/` for the design, installation, and rollback.
 
 ## Extension channels
 
