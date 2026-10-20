@@ -24,7 +24,8 @@ cleanup() {
   # Only the isolated broker (pid file in the throwaway agent dir) and the daemon started below.
   [ -f "$R/agent/intercom/broker.pid" ] && kill "$(cat "$R/agent/intercom/broker.pid")" 2>/dev/null || true
   [ -f "$R/sessiond.pid" ] && kill "$(cat "$R/sessiond.pid")" 2>/dev/null || true
-  for i in 1 2 3 4 5 6 7 8; do
+  # The daemon flushes its state files on shutdown, which can take a while: wait for it before removing.
+  for i in $(seq 1 40); do
     alive=0
     for f in "$R/agent/intercom/broker.pid" "$R/sessiond.pid"; do
       [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && alive=1
