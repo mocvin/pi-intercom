@@ -23,8 +23,13 @@ cleanup() {
     [ "$alive" = 0 ] && break
     sleep 1
   done
+  # Anything still running inside the throwaway directory (for example a broker spawned by the woken session).
+  for p in /proc/[0-9]*; do
+    case "$(readlink "$p/cwd" 2>/dev/null)" in "$R"*) kill "${p#/proc/}" 2>/dev/null || true ;; esac
+  done
+  sleep 2
   # Set KEEP=1 to keep the throwaway directory (logs, audit, session files) for inspection.
-  [ "${KEEP:-}" = 1 ] || rm -rf "$R"
+  [ "${KEEP:-}" = 1 ] || { rm -rf "$R"; sleep 1; rm -rf "$R"; }
 }
 trap cleanup EXIT
 clean nohup node "$PIWEB/dist/server/sessiond.js" > "$R/sessiond.log" 2>&1 &
