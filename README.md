@@ -4,7 +4,7 @@
 
 # Pi Intercom
 
-> **About this fork.** This is a fork of [nicobailon/pi-intercom](https://github.com/nicobailon/pi-intercom) that adds an opt-in way to deliver a message to a Pi session that is persisted but not loaded, by reopening it (for example a saved PI WEB conversation). See [Waking persisted sessions](#waking-persisted-sessions) and [`docs/session-waker/`](docs/session-waker/ARCHITECTURE.md). Everything else is upstream pi-intercom; the license and credit are unchanged.
+> **About this fork.** This is a fork of [nicobailon/pi-intercom](https://github.com/nicobailon/pi-intercom) that adds an opt-in way to deliver a message to a Pi session that is persisted but not loaded, by reopening it (for example a saved PI WEB conversation). See [Waking persisted sessions](#waking-persisted-sessions) and [`docs/session-waker/`](docs/session-waker/ARCHITECTURE.md). It is published as the package `pi-intercom-wake`, a drop-in replacement: remove `npm:pi-intercom` before installing it (see [Installing this fork](#installing-this-fork)). Everything else is upstream pi-intercom; the license and credit are unchanged.
 
 Direct 1:1 messaging between pi sessions on the same machine. Send context, findings, or requests from one session to another — whether you're driving the conversation or letting agents coordinate.
 
