@@ -4,21 +4,36 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
-### Fork
+### Fork (pi-intercom-wake)
+- `0.18.0-wake.1`: based on pi-intercom 0.18.0 and its unreleased fix #183 (below). The wake feature is unchanged.
 - `0.17.1-wake.2`: `/wake-trust on | off | list | revoke <id>` lets the user allow a session to wake others without a confirmation dialog. The permission is tied to that session's Pi session id, expires after `wake.trustDays` (30), needs the user's confirmation to grant or revoke, and is recorded in the audit (`trust_granted`, `trust_revoked`, and `confirmedBy` on every wake). Every other check still applies.
 - Published as `pi-intercom-wake` (version `0.17.1-wake.1`), a drop-in replacement for `pi-intercom` with the wake feature: same tool, commands, broker and runtime directory, so install one or the other, never both.
 
-### Added
+### Added (fork)
 - `send` with `wakeIfDisconnected: true` reaches a persisted Pi session that is not connected: the message is held once in the broker (`wake-v1`), the session is reopened through a wake provider, and the internal `/intercom-wake` command lets the message arrive without a model call. Opt-in (`wake.enabled`), restricted to `wake.allowCwds`, confirmed by the user, with secret-content, duplicate and rate-limit guards and a private audit file (hash and length of the text, never the text). Plain sends only. The built-in `pi-web-sessiond` provider uses internal PI WEB session daemon routes (`commands/run`, so a session without the command refuses it instead of passing it to its model) and is experimental; other hosts can register a provider. `/intercom-wake-status` shows the settings and recent attempts.
 - The broker can hold a message for a persisted Pi session that is not connected and that it has never seen (`send` with a `wake` target, broker feature `wake-v1`). The target is exact: a Pi session id plus an absolute directory. The message is queued once in the mailbox, with delivery `queued` and code `wake_pending`, and released when a session with that Pi session id and directory registers. It reuses the mailbox limits (24 hours, 256 messages), replay guard, cancellation, receipts and routing scopes. A wake send is plain only (no reply, ask or supersede), cannot target the sender, and is delivered normally when the target is already connected. A client that is connected to a broker without `wake-v1` refuses a wake send before anything is sent. Nothing reopens a session yet; that is a separate step.
 - Sessions now report their real Pi session id as `piSessionId` in the roster, and the broker advertises the additive `pi-session-id-v1` feature. The intercom `id` can be a pinned stable id or a claimed alias, so it does not always identify the Pi session behind it. Older clients and brokers keep working unchanged: the field is optional, validated (non-empty string, at most 256 characters) and absent for clients that never send it.
+
+### Changed
+- On Pi 1.2.0 or newer, a message that wakes an idle session no longer adds a "New intercom message above." line to the transcript. Older Pi still shows it, because it needs that line to run other extensions' prompt additions. Thanks to [@odfalik](https://github.com/odfalik) for #182.
+
+## [0.18.0] - 2026-10-20
+
+### Highlights
+- In fullscreen mode, click a message to expand or collapse just that one.
+- Sending to a session that isn't connected now says the message is waiting for it, instead of `Message sent`.
+- Queued messages are no longer lost a few seconds after the last session closes.
+- A shortened or slightly wrong session name now reaches the right session, or tells you which name you probably meant.
+- `handover` works when your selected model is a virtual model, such as a router.
+
+### Added
 - In fullscreen mode, clicking an intercom message expands or collapses just that message. Ctrl+O still expands or collapses all of them at once. Thanks to [@summer-tt](https://github.com/summer-tt) for #178.
 
 ### Fixed
-- `handover` works when the selected model is a Pi virtual model, such as a router. Before, generating the handover failed with `Virtual model … must be routed before streaming`, because it called `complete()`, which Pi doesn't route. It now uses `streamSimple()`. Thanks to [@colinperel](https://github.com/colinperel) for #176 and #177.
-- A `send`, `reply`, or progress update to a disconnected session said `Message sent`, even though the message was only held in the broker's mailbox until that session came back. The result now says the session is not connected and the message is waiting in the broker mailbox until it reconnects. A message that reaches a session after it was replaced or shut down was dropped with no receipt. It now reports `expired`, so the sender's last known delivery state shows the drop. Thanks to [@Jaggerxtrm](https://github.com/Jaggerxtrm) for #172.
-- A slightly wrong session name failed with a misleading `Session not found`, which reads as if the session had died. This hit `send`, `ask`, and `contact_supervisor` most often with Herdr subagent names like `subagent-chat-…` that were cut short. A name that is not an exact match now resolves to the one connected session whose name starts with it, and the result says which session it resolved to. A message to the exact name of a session that is offline still waits in that session's mailbox and never goes to a different session. If several names start with it, the error lists them. Otherwise the error names the closest session name and points at `intercom list`. `status` now shows the session's own name. Thanks to [@cabi](https://github.com/cabi) for #174 and #175.
-- A message queued for a disconnected session was lost about 5 seconds after the last connected session left, because the broker exited when idle and its mailbox lives only in memory. The 24-hour mailbox retention could not be reached in that case. The broker now stays running while its mailbox holds messages, and exits once there are no sessions and the last queued message has been delivered or has expired. Thanks to [@odfalik](https://github.com/odfalik) for raising this in #173.
+- `handover` failed with `Virtual model … must be routed before streaming` when the selected model was a Pi virtual model, such as a router. It now works with virtual models. Thanks to [@colinperel](https://github.com/colinperel) for #176 and #177.
+- A `send`, `reply`, or progress update to a disconnected session said `Message sent`, even though the message was only waiting in the broker's mailbox for that session to come back. The result now says the session is not connected and the message is waiting until it reconnects. A message that arrived after its session was replaced or shut down used to vanish without a trace; the sender now gets an `expired` receipt for it. Thanks to [@Jaggerxtrm](https://github.com/Jaggerxtrm) for #172.
+- A slightly wrong session name failed with `Session not found`, which reads as if the session had died. This happened most often with Herdr subagent names like `subagent-chat-…` that were cut short. A name that isn't an exact match now goes to the one connected session whose name starts with it, and the result says which session that was. A message to the exact name of an offline session still waits in that session's mailbox and never goes to a different session. If several names match, the error lists them; if none do, it suggests the closest name and points to `intercom list`. `status` now shows the session's own name. Thanks to [@cabi](https://github.com/cabi) for #174 and #175.
+- Messages queued for a disconnected session were lost about 5 seconds after the last connected session closed, because the broker shut down when idle and its mailbox lives in memory. The broker now stays running while it holds queued messages, and shuts down once they have been delivered or have expired (after 24 hours). Thanks to [@odfalik](https://github.com/odfalik) for raising this in #173.
 
 ## [0.17.1] - 2026-10-14
 

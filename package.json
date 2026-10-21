@@ -1,6 +1,6 @@
 {
   "name": "pi-intercom-wake",
-  "version": "0.17.1-wake.2",
+  "version": "0.18.0-wake.1",
   "description": "Fork of pi-intercom that can wake persisted Pi sessions (opt-in): queue a message once, reopen the original session, deliver it normally. Drop-in replacement: remove pi-intercom first.",
   "repository": { "type": "git", "url": "git+https://github.com/mocvin/pi-intercom.git" },
   "homepage": "https://github.com/mocvin/pi-intercom#readme",

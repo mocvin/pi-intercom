@@ -3437,7 +3437,7 @@ test("idle interactive sessions wake through a user prompt instead of triggerTur
 	});
 
 	try {
-		piIntercomExtension(harness.pi as never);
+		piIntercomExtension(harness.pi as never, "1.1.0");
 		await harness.emitLifecycle("session_start");
 		const worker = await waitForSessionByName(planner, "idle-trigger-worker");
 
@@ -3459,6 +3459,26 @@ test("idle interactive sessions wake through a user prompt instead of triggerTur
 	}
 });
 
+test("on Pi 1.2.0 and newer, idle sessions wake through triggerTurn without a wake line", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("trigger-turn-worker", { hasUI: true, isIdle: () => true });
+
+  try {
+    piIntercomExtension(harness.pi as never, "1.2.0");
+    await harness.emitLifecycle("session_start");
+    const worker = await waitForSessionByName(planner, "trigger-turn-worker");
+
+    assert.equal((await planner.send(worker.id, { messageId: "trigger-turn", text: "Handle this now" })).delivered, true);
+    await waitForCondition(() => harness.sentMessages.length === 1, "injected message");
+    assert.deepEqual(harness.sentMessages[0]?.options, { triggerTurn: true });
+    assert.deepEqual(harness.userMessages, []);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
 test("an idle wake sent by another extension covers intercom messages, and intercom's wake blocks theirs", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { planner, cleanup } = await setupClients();
@@ -3468,7 +3488,7 @@ test("an idle wake sent by another extension covers intercom messages, and inter
   const sessionManager = harness.ctx.sessionManager;
 
   try {
-    piIntercomExtension(harness.pi as never);
+    piIntercomExtension(harness.pi as never, "1.1.0");
     await harness.emitLifecycle("session_start");
     const worker = await waitForSessionByName(planner, "shared-wake-worker");
     reservations.set(sessionManager, { sessionId: sessionManager.getSessionId(), sentAt: Date.now() });
@@ -3594,7 +3614,7 @@ for (const outcome of ["success", "failure", "abort", "cancel"]) {
     let idle = false;
     const harness = createExtensionHarness(`compact-${outcome}`, { hasUI: true, isIdle: () => idle });
     try {
-      piIntercomExtension(harness.pi as never);
+      piIntercomExtension(harness.pi as never, "1.1.0");
       await harness.emitLifecycle("session_start");
       const target = await waitForSessionByName(planner, `compact-${outcome}`);
       const receipts = new Map<string, string[]>();
@@ -3759,7 +3779,7 @@ test("human-first releases the next held peer only after the woken run starts", 
     let idle = false;
     const harness = createExtensionHarness("human-first-wake", { hasUI: true, isIdle: () => idle });
     try {
-      piIntercomExtension(harness.pi as never);
+      piIntercomExtension(harness.pi as never, "1.1.0");
       await harness.emitLifecycle("session_start");
       const target = await waitForSessionByName(planner, "human-first-wake");
       await harness.emitLifecycle("agent_start");
@@ -5622,7 +5642,7 @@ test("subagent relay events wake an idle orchestrator and steer a busy one", { c
   let idle = true;
   const harness = createExtensionHarness("relay-orchestrator", { hasUI: true, isIdle: () => idle });
   try {
-    piIntercomExtension(harness.pi as never);
+    piIntercomExtension(harness.pi as never, "1.1.0");
     await harness.emitLifecycle("session_start");
 
     harness.pi.events.emit("subagent:result-intercom", { to: "relay-orchestrator", requestId: "idle-result", message: "subagent result\n\nStatus: completed" });
@@ -5651,7 +5671,7 @@ test("a wake prompt that never starts a run stops blocking later wakes after its
   const harness = createExtensionHarness("unstarted-wake", { hasUI: true, isIdle: () => true });
   const relay = (message: string) => harness.pi.events.emit("subagent:control-intercom", { to: "unstarted-wake", message });
   try {
-    piIntercomExtension(harness.pi as never);
+    piIntercomExtension(harness.pi as never, "1.1.0");
     await harness.emitLifecycle("session_start");
 
     // An input handler can handle the wake prompt, so no agent_start follows it.

@@ -1,4 +1,4 @@
-import { BorderedLoader, defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, defineTool, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import { Type } from "typebox";
@@ -163,6 +163,15 @@ interface SupervisorInterviewReply {
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+// Pi 1.2.0 runs before_agent_start for sendMessage({ triggerTurn: true }) turns (pi#5581) and marks
+// the session busy as soon as such a run starts. An unparseable version counts as older Pi.
+function triggerTurnRunsPromptLifecycle(piVersion: string): boolean {
+  const match = /^(\d+)\.(\d+)\./.exec(piVersion);
+  if (!match) return false;
+  const major = Number(match[1]);
+  return major > 1 || (major === 1 && Number(match[2]) >= 2);
 }
 
 export function explicitCrossMachineSendRestriction(options: {
@@ -680,8 +689,9 @@ function getNamePollMs(): number {
   }
   return 1000;
 }
-export default function piIntercomExtension(pi: ExtensionAPI) {
+export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSION) {
   let client: IntercomClient | null = null;
+  const wakeWithTriggerTurn = triggerTurnRunsPromptLifecycle(piVersion);
   const config: IntercomConfig = loadConfig();
   const askTimeoutMs = getAskTimeoutMs();
   const localExtensions = new Map<string, {
@@ -1326,6 +1336,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const replyInstruction = replyCommand ? `\n\nTo reply, use the intercom tool: ${replyCommand}` : "";
     const deliveryMetadata = formatInboundDeliveryMetadata(injectedMessage);
     const trigger = delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger);
+    const triggerContext = trigger ? getLiveContext(runtimeContext, generation) : undefined;
+    const startTurn = wakeWithTriggerTurn && triggerContext?.isIdle() === true;
     pi.sendMessage(
       {
         customType: "intercom_message",
@@ -1333,13 +1345,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         display: true,
         details: deliveredEntry,
       },
-      trigger ? undefined : { deliverAs: "steer" }
+      startTurn ? { triggerTurn: true } : trigger ? undefined : { deliverAs: "steer" }
     );
-    // Pi skips before_agent_start for sendMessage({ triggerTurn: true }) turns (pi#5581),
-    // so wake an idle session with a user prompt that runs the normal prompt lifecycle.
-    const wakeContext = trigger ? getLiveContext(runtimeContext, generation) : undefined;
-    if (wakeContext?.isIdle() && !isIdleWakePending(wakeContext.sessionManager)) {
-      reserveIdleWake(wakeContext.sessionManager);
+    // Pi before 1.2.0 skips before_agent_start for sendMessage({ triggerTurn: true }) turns (pi#5581),
+    // so wake an idle session there with a user prompt that runs the normal prompt lifecycle.
+    if (!wakeWithTriggerTurn && triggerContext?.isIdle() && !isIdleWakePending(triggerContext.sessionManager)) {
+      reserveIdleWake(triggerContext.sessionManager);
       pi.sendUserMessage("New intercom message above.", { deliverAs: "steer" });
     }
     emitMessageReceipt(injectedMessage.id, "injected");
