@@ -275,6 +275,17 @@ It only works when `wake.enabled` is set, asks the user to confirm, and never ap
 If the result says the outcome is unconfirmed or unknown, the message is still held: do not resend it. Never put secrets in the message.
 A session the user trusted with `/wake-trust on` wakes without a dialog; only the user can grant or revoke that, never ask to be trusted on your own initiative.
 
+## Creating a Session in Another Project
+
+To start a NEW session in another project and give it a task, use
+`intercom({ action: "spawn", cwd: "/abs/path/of/the/project", message: "the task" })`.
+It works only when `wake.enabled` is set and the directory is in `wake.allowCwds`, and by default it asks the user every time (`wake.spawnConfirm`), including for senders with `/wake-trust`.
+The new session starts with that project's defaults; you cannot choose its model or tools. It answers through intercom like any other session.
+Use `send` with `wakeIfDisconnected` instead when the project already has a saved session for the work. A session created by `spawn` cannot spawn others. Do not spawn repeatedly or in loops, and never put secrets in the task.
+
+To tidy up a session you created with `spawn`, use `intercom({ action: "archive", to: "<full Pi session id>", cwd: "/abs/path" })`.
+It only works for sessions you created, the user is always asked (even with `/wake-trust`), it is reversible, and it is refused while the session is working or if it never answered. Never archive on your own initiative while the session may still be needed.
+
 ## Important Constraints
 
 ### `ask` Limitations

@@ -319,3 +319,46 @@ The closed form is the one side effect that cannot be avoided from intercom; the
 - Integration: `intercom.integration.test.ts` — real broker, two extension harnesses, fake provider.
 - End to end: `scripts/e2e/run.sh` starts a PI WEB session daemon and a broker in a throwaway directory with a cleaned environment, writes a persisted session that was never loaded, and checks the whole flow (23 checks); `scripts/e2e/run.sh busy` covers sessions that are already open and busy. Each run stops only the processes it started and removes its directory.
 - Run the suite with `scripts/test-isolated.sh`: inside a Pi session, `PI_CODING_AGENT_DIR` would otherwise point the tests at the live broker.
+
+## 16. Creare una sessione in un altro progetto: `spawn` ✅
+
+```mermaid
+sequenceDiagram
+    participant S as Sessione mittente
+    participant C as controller (performWake, spawn: true)
+    participant U as Utente
+    participant D as sessiond
+    participant B as Broker
+    participant N as Nuova sessione
+    S->>C: intercom spawn { cwd, message }
+    C->>C: enabled, cwd in allowCwds, segreti, nessuna catena, deduplica, limite spawnMax
+    C->>U: dialog (default: sempre, anche per /wake-trust)
+    U-->>C: conferma
+    C->>C: audit attempting (kind spawn)
+    C->>D: POST /sessions { cwd }  → id Pi
+    C->>B: send al nuovo id con wake target (tenuto una sola volta)
+    C->>D: POST /sessions/:id/commands/run "/intercom-wake <id>"
+    D->>N: esegue il comando (nessuna chiamata al modello)
+    N->>B: si registra; il broker consegna il messaggio
+    B-->>C: ricevuta → delivered
+```
+
+- **Stesso flusso del wake**, senza il catalogo: la sessione nuova non è salvata finché il modello non risponde, quindi non è elencabile; il suo id arriva direttamente da `POST /sessions`.
+- **Permesso:** `wake.spawnConfirm` = `always` (default; chiede sempre e blocca senza UI), `trusted` (i mittenti con `/wake-trust` non vengono richiesti) o `never`. Distinto da `wake.confirm` perché creare una sessione è più forte di svegliarne una.
+- **Nessuna catena:** una sessione che compare come destinazione di uno `spawn` nell'audit non può usarlo.
+- **Limiti:** `wake.spawnMax` per `wake.spawnWindowMs` (5 per ora), oltre ai limiti globali del wake e alla deduplica (chiave `spawn + cwd + testo`).
+- **Esiti incerti:** se la creazione scade, una sessione vuota potrebbe esistere e il messaggio non viene inviato. Se la consegna viene rifiutata, il messaggio in coda è ritirato e la sessione vuota resta (nessun cleanup automatico).
+- **Verifica:** `scripts/e2e/run.sh` (37 controlli, undici sullo spawn) su daemon isolato; il modello non c'è, quindi si controlla il messaggio via API del daemon invece del file di storia.
+
+## 17. Archiviare una sessione creata da `spawn`: `archive` ✅
+
+- **Conferma umana sempre.** Nessuna configurazione e nessun `/wake-trust` tolgono il dialogo; senza UI l'azione si blocca (`confirmation_unavailable`). Diverso da `wake.confirm` e `wake.spawnConfirm`, che si possono allentare.
+- **Solo sessioni proprie.** L'audit deve contenere uno `spawn` non bloccato né rifiutato con `target.piSessionId` uguale, cartella uguale e `sender.piSessionId` uguale al mittente. Un mittente diverso, un wake, un'altra cartella → `not_created_by_you`, senza nemmeno disturbare l'utente. Mai sé stessi.
+- **Provider sessiond:** solo `POST /sessions/bulk/archive` (archivia senza caricare una sessione dormiente). Il daemon risponde **200 anche per le sessioni che rifiuta**: il successo vale solo se l'id è in `archivedSessionIds`; altrimenti si legge `failures`.
+- **Sessione al lavoro:** il daemon rifiuta («Stop current session activity before archiving»); il provider lo traduce in `busy`. Verificato su daemon isolato con una sessione in streaming: turno completato normalmente, nessuna archiviazione; riprovando a sessione ferma funziona.
+- **Reversibile:** la sessione viene chiusa e spostata nell'archivio di PI WEB; non si cancella nulla. Un wake successivo è rifiutato («archived»).
+- **Limite noto:** una sessione che non ha mai risposto non ha ancora un file salvato; il daemon risponde con errore (ENOENT) e l'azione fallisce senza dichiarare successo.
+- **Limiti:** `wake.archiveMax` per `wake.spawnWindowMs` (10 per ora); audit `kind: "archive"`, `confirmedBy: "user"`, senza testo.
+- **Dialoghi :** PI WEB rifiuta un dialogo oltre 1000 caratteri; tutti i dialoghi (wake, spawn, archive) sono costruiti con `dialogBody` entro 900 caratteri e un dialogo che fallisce è `confirmation_failed`, mai `user_declined`.
+- **Verifica:** unit test (controller, policy, provider), E2E isolato `run.sh` (44 controlli) e `run.sh busy` (idle, al lavoro, mai risposta).
+

@@ -524,7 +524,7 @@ This feature ships in a fork of pi-intercom published as the package **`pi-inter
 pi remove npm:pi-intercom
 pi install npm:pi-intercom-wake                                   # from npm
 # or, pinned to a release tag, straight from GitHub:
-pi install git:github.com/mocvin/pi-intercom@v0.18.0-wake.1
+pi install git:github.com/mocvin/pi-intercom@v0.18.0-wake.4
 ```
 
 Then restart the intercom broker once (it is a long-lived process that keeps running the old code) and `/reload` the sessions; see [`docs/session-waker/INSTALL.md`](docs/session-waker/INSTALL.md). Sessions that still run the original pi-intercom keep working with this broker, and the other way round. To go back, remove `pi-intercom-wake`, install `npm:pi-intercom` again, and restart the broker.
@@ -563,6 +563,9 @@ It is **off by default** and fail-closed. Settings under `wake` in `config.json`
 | `wake.confirm` | `"always"` | `"always"` asks the user before every wake and blocks when there is no UI, unless the sending session has a `/wake-trust` grant. `"never"` skips the dialog for every session in allowlisted directories. |
 | `wake.provider` | `"pi-web-sessiond"` | Registered provider id. |
 | `wake.sessiondSocket` / `wake.sessiondUrl` | — | Endpoint of the PI WEB session daemon. Otherwise `PI_WEB_SESSIOND_SOCKET` / `PI_WEB_SESSIOND_URL` is used. The endpoint is never guessed. A daemon started with its default socket does not export it to its sessions, so set `wake.sessiondSocket` (usually `~/.pi-web/sessiond.sock`, as an absolute path). |
+| `wake.spawnConfirm` | `"always"` | Whether `spawn` (creating a session in another project) asks the user. `"always"` asks every time, `/wake-trust` senders included, and blocks when there is no UI. `"trusted"` lets `/wake-trust` senders skip the dialog. `"never"` never asks (allowlisted directories only). |
+| `wake.spawnMax` / `wake.spawnWindowMs` | 5 / 3600000 | Sessions `spawn` may create per window, across all senders. |
+| `wake.archiveMax` | 10 | `archive` actions allowed per `wake.spawnWindowMs`. Archiving always asks the user; there is no setting for that. |
 | `wake.dedupMs` | 600000 | An identical message to the same session inside this window is refused. |
 | `wake.perTargetMax` / `wake.perTargetWindowMs` | 3 / 600000 | Wakes allowed per session per window. |
 | `wake.globalMax` / `wake.globalWindowMs` | 10 / 3600000 | Wakes allowed in total per window, across all sessions of the user. |
@@ -584,6 +587,24 @@ With `confirm: "always"`, every wake asks the user. To let one session (for exam
 | `/wake-trust revoke <Pi session id>` | Remove another session's permission (asks for confirmation) |
 
 Changes always need the user's confirmation in a dialog, and a session without a UI cannot change them. A trusted session skips only the dialog: the directory allowlist, the secret check, the duplicate window, the rate limits and the audit still apply, and every wake records how it was approved (`confirmedBy: user | trust | config`). Grants are kept in `wake-trust.json` next to `config.json` (mode 0600); an unreadable file grants nothing; deleting it removes every grant. This protects against mistakes and against a model acting on its own, not against a hostile local process with shell access, which could also answer dialogs through PI WEB's API.
+
+#### Creating a session in another project: `spawn`
+
+A session can start a **new** session in another project and give it a task:
+
+```ts
+intercom({ action: "spawn", cwd: "/home/me/projects/other-app", message: "Run the weekly dependency report and send me the summary." })
+```
+
+The directory must be in `wake.allowCwds`, and `wake.enabled` must be on. By default the user is **asked every time**, including for sessions with a `/wake-trust` grant, because creating a session starts a model in another project with that project's permissions (`wake.spawnConfirm` changes this). The new session starts with that project's defaults (the sender cannot choose model or tools), receives the task once through the same broker mailbox as a wake, and answers through intercom. A session created by `spawn` cannot spawn others. Use `send` with `wakeIfDisconnected` to reach an existing saved session instead. Same secret check, duplicate window, audit (`kind: "spawn"`) and a separate rate limit (`wake.spawnMax`).
+
+#### Archiving a session `spawn` created: `archive`
+
+```ts
+intercom({ action: "archive", to: "<full Pi session id returned by spawn>", cwd: "/home/me/projects/other-app" })
+```
+
+Tidies up a session the same sender created with `spawn`. **The user is always asked**: no setting and no `/wake-trust` grant removes the dialog, and without a UI nothing happens. Only sessions that the audit shows this sender created can be archived (anything else the user archives in PI WEB). The archive is reversible: the session is closed and moved to PI WEB's archive, never deleted, and can be restored there. PI WEB refuses to archive a session that is working (the action reports it as busy; try again when it is idle). A session that never answered has no saved file yet and cannot be archived; PI WEB reports that.
 
 Messages that look like secrets (tokens, private keys, passwords) or exceed 32 KiB are refused. Every attempt is recorded in `wake-audit.jsonl` next to `config.json` (mode 0600): time, outcome, ids, directory, text length and SHA-256, never the text. The duplicate window and the rate limits are computed from that file, so they hold across all sessions. If the audit cannot be written, nothing is woken. `/intercom-wake-status` shows the settings, whether the broker supports `wake-v1`, and recent attempts.
 

@@ -10,6 +10,7 @@ export type WakeOutcome =
   | "accepted_unconfirmed" // the host accepted the wake but no receipt arrived in time
   | "uncertain"           // the host's answer is unknown; the message stays held
   | "failed"              // the host refused; the held message was withdrawn
+  | "archived"            // an archive action: the host archived a session that spawn had created
   | "refused"             // the user declined
   | "blocked"             // a policy or validation check stopped it before anything was held
   | "trust_granted"       // the user allowed a session to wake others without confirmation (/wake-trust on)
@@ -17,6 +18,8 @@ export type WakeOutcome =
 
 export interface WakeAuditEntry {
   ts: number;
+  /** `spawn` for a session created by the spawn action; absent or `wake` for a wake of an existing session. */
+  kind?: "wake" | "spawn" | "archive";
   outcome: WakeOutcome;
   code: string;
   messageId: string;

@@ -170,6 +170,9 @@ test("loadConfig leaves waking persisted sessions off, confirmed, and empty by d
       const wake = loadConfig().wake;
       assert.equal(wake.enabled, false);
       assert.equal(wake.confirm, "always");
+      assert.equal(wake.spawnConfirm, "always");
+      assert.equal(wake.spawnMax, 5);
+      assert.equal(wake.archiveMax, 10);
       assert.deepEqual(wake.allowCwds, []);
       assert.equal(wake.provider, "pi-web-sessiond");
       assert.equal(wake.perTargetMax, 3);
@@ -194,11 +197,16 @@ test("loadConfig reads wake settings and rejects unknown or invalid ones", async
       const wake = loadConfig().wake;
       assert.deepEqual([wake.enabled, wake.confirm, wake.perTargetMax, wake.sessiondSocket], [true, "never", 5, "/run/pi-web/sessiond.sock"]);
       assert.deepEqual(wake.allowCwds, ["/work/a", "/work/b"]);
+      write({ spawnConfirm: "trusted", spawnMax: 2 });
+      assert.deepEqual([loadConfig().wake.spawnConfirm, loadConfig().wake.spawnMax], ["trusted", 2]);
       for (const [bad, message] of [
         [{ enabled: "yes" }, /"wake.enabled" must be a boolean/],
         [{ allowCwds: ["relative"] }, /"wake.allowCwds" must be an array of absolute/],
         [{ allowCwds: "/work" }, /"wake.allowCwds" must be an array of absolute/],
         [{ confirm: "sometimes" }, /"wake.confirm" must be "always" or "never"/],
+        [{ spawnConfirm: "sometimes" }, /"wake.spawnConfirm" must be "always", "trusted" or "never"/],
+        [{ archiveMax: 0 }, /"wake.archiveMax" must be a positive integer/],
+        [{ spawnMax: 0 }, /"wake.spawnMax" must be a positive integer/],
         [{ dedupMs: 0 }, /"wake.dedupMs" must be a positive integer/],
         [{ trustDays: -1 }, /"wake.trustDays" must be a positive integer/],
         [{ globalMax: 1.5 }, /"wake.globalMax" must be a positive integer/],

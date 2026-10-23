@@ -130,3 +130,56 @@ test("a message id that cannot be carried safely in a command is refused before 
     assert.equal(requests.length, 0);
   });
 });
+
+test("create posts only the directory to /sessions and returns the new id", async () => {
+  await withDaemon((req, _b, res) => (req.url === "/health" ? json(res, 200, health) : json(res, 200, { id: "0198-new-session", path: "/p/n.jsonl", cwd: "/repo", persisted: false })), async (socketPath, requests) => {
+    const provider = createSessiondProvider({ sessiondSocket: socketPath });
+    assert.deepEqual(await provider.create!("/repo"), { piSessionId: "0198-new-session" });
+    assert.deepEqual(requests.map((r) => `${r.method} ${r.url}`), ["GET /health", "POST /sessions"]);
+    assert.deepEqual(JSON.parse(requests[1]!.body), { cwd: "/repo" });
+  });
+});
+
+test("create fails closed on an unexpected answer", async () => {
+  const cases: Array<[string, Handler, string, boolean]> = [
+    ["refused", (r, _b, res) => (r.url === "/health" ? json(res, 200, health) : json(res, 400, { error: "cwd is not allowed" })), "rejected", true],
+    ["server error", (r, _b, res) => (r.url === "/health" ? json(res, 200, health) : json(res, 500, {})), "server_error", false],
+    ["no id", (r, _b, res) => (r.url === "/health" ? json(res, 200, health) : json(res, 200, { ok: true })), "unsupported", true],
+    ["unsafe id", (r, _b, res) => (r.url === "/health" ? json(res, 200, health) : json(res, 200, { id: "../../etc" })), "unsupported", true],
+    ["not a session daemon", (_r, _b, res) => json(res, 200, { ok: true, version: { component: "web" } }), "unsupported", true],
+  ];
+  for (const [label, handler, code, definitive] of cases) {
+    await withDaemon(handler, async (socketPath, requests) => {
+      await expectWakeError(createSessiondProvider({ sessiondSocket: socketPath }).create!("/repo"), code, definitive);
+      if (label === "not a session daemon") assert.equal(requests.some((r) => r.method === "POST"), false, "nothing is created on a daemon that is not recognised");
+    });
+  }
+});
+
+test("archive uses only the bulk route and succeeds only when the daemon lists the session as archived", async () => {
+  const ID = "0198-archive-me";
+  await withDaemon((req, _b, res) => (req.url === "/health" ? json(res, 200, health) : json(res, 200, { archived: true, archivedSessionIds: [ID], failures: [] })), async (socketPath, requests) => {
+    await createSessiondProvider({ sessiondSocket: socketPath }).archive!({ piSessionId: ID, cwd: "/repo" });
+    assert.deepEqual(requests.map((r) => `${r.method} ${r.url}`), ["GET /health", "POST /sessions/bulk/archive"]);
+    assert.deepEqual(JSON.parse(requests[1]!.body), { sessions: [{ id: ID, cwd: "/repo" }] });
+  });
+});
+
+test("archive reads the failures: the daemon answers 200 even for a session it refused", async () => {
+  const ID = "0198-archive-me";
+  const answer = (body: unknown): Handler => (r, _b, res) => (r.url === "/health" ? json(res, 200, health) : json(res, 200, body));
+  const cases: Array<[string, Handler, string, boolean]> = [
+    ["working", answer({ archived: true, archivedSessionIds: [], failures: [{ sessionId: ID, error: "Stop current session activity before archiving" }] }), "busy", true],
+    ["not found", answer({ archived: true, archivedSessionIds: [], failures: [{ sessionId: ID, error: "Session not found" }] }), "not_found", true],
+    ["other failure", answer({ archived: true, archivedSessionIds: [], failures: [{ sessionId: ID, error: "Session is not persisted" }] }), "rejected", true],
+    ["archived another id only", answer({ archived: true, archivedSessionIds: ["0198-other"], failures: [] }), "rejected", true],
+    ["unexpected body", answer({ ok: true }), "unsupported", true],
+    ["server error", (r, _b, res) => (r.url === "/health" ? json(res, 200, health) : json(res, 500, {})), "server_error", false],
+    ["bad request", (r, _b, res) => (r.url === "/health" ? json(res, 200, health) : json(res, 400, { error: "cwd is not allowed" })), "rejected", true],
+  ];
+  for (const [label, handler, code, definitive] of cases) {
+    await withDaemon(handler, async (socketPath) => {
+      await assert.rejects(createSessiondProvider({ sessiondSocket: socketPath }).archive!({ piSessionId: ID, cwd: "/repo" }), (error: unknown) => error instanceof WakeError && error.code === code && error.definitive === definitive, label);
+    });
+  }
+});

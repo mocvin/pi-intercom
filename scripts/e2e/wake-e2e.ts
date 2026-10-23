@@ -12,7 +12,7 @@ import { spawnBrokerIfNeeded } from "../../broker/spawn.ts";
 import { getIntercomDirPath } from "../../broker/paths.ts";
 import { defaultWakeConfig } from "../../config.ts";
 import { WakeAudit, wakeAuditPath } from "../../wake/audit.ts";
-import { performWake, type WakeDeps } from "../../wake/controller.ts";
+import { performArchive, performWake, type WakeDeps } from "../../wake/controller.ts";
 import { createSessiondProvider } from "../../wake/sessiond.ts";
 import { WakeTrustStore, wakeTrustPath } from "../../wake/trust.ts";
 
@@ -64,12 +64,16 @@ const dormantFile = writeFixtureSession(dormantId, "e2e-dormant");
 const archivedFile = writeFixtureSession(archivedId, "e2e-archived");
 const trustedTargetId = randomUUID();
 writeFixtureSession(trustedTargetId, "e2e-dormant-trusted");
+const longMessageTargetId = randomUUID();
+writeFixtureSession(longMessageTargetId, "e2e-dormant-long");
+const brokenDialogTargetId = randomUUID();
+writeFixtureSession(brokenDialogTargetId, "e2e-dormant-broken-dialog");
 
 // ---- Before: the daemon lists the saved sessions without loading them.
 const before = await daemon("GET", `/health`);
 check("daemon starts with no loaded session", before.json.activeSessions === 0, `activeSessions=${before.json.activeSessions}`);
 const listed = await daemon("GET", `/sessions?cwd=${encodeURIComponent(work)}`);
-check("catalog lists the saved sessions", listed.status === 200 && listed.json.length === 3, `status=${listed.status} n=${listed.json?.length}`);
+check("catalog lists the saved sessions", listed.status === 200 && listed.json.length === 5, `status=${listed.status} n=${listed.json?.length}`);
 const archive = await daemon("POST", `/sessions/bulk/archive`, { sessions: [{ id: archivedId, cwd: work }] });
 check("one fixture session is archived", archive.status === 200, `status=${archive.status} ${JSON.stringify(archive.json).slice(0, 120)}`);
 check("reading the catalog loaded nothing", (await daemon("GET", `/health`)).json.activeSessions === 0);
@@ -123,13 +127,20 @@ new WakeTrustStore(wakeTrustPath()).revoke("e2e-sender-pi");
 const untrusted = await performWake({ ...deps(undefined, { confirm: "always" }) }, { to: randomUUID(), cwd: work, message: "x0" });
 check("without the grant and without a UI the wake is refused", !untrusted.ok && untrusted.code === "confirmation_unavailable", untrusted.code);
 
+// ---- A long message: the dialog must stay within what PI WEB accepts (1000 characters), as the real ctx.ui.confirm enforces.
+const piWebConfirm = async (title: string, body: string): Promise<boolean> => { if (title.length > 1000 || body.length > 1000) throw new Error("message exceeds its length limit"); return true; };
+const longWake = await performWake({ ...deps(undefined, { confirm: "always" }), confirm: piWebConfirm }, { to: longMessageTargetId, cwd: work, message: `E2E long brief. ${"Context sentence. ".repeat(400)}` });
+check("a very long message still gets a dialog PI WEB accepts, and is delivered", longWake.ok && longWake.outcome === "delivered", `${longWake.outcome} (${longWake.code}) ${longWake.text.slice(0, 100)}`);
+const brokenDialog = await performWake({ ...deps(undefined, { confirm: "always" }), confirm: async () => { throw new Error("dialog refused"); } }, { to: brokenDialogTargetId, cwd: work, message: "E2E dialog failure" });
+check("a dialog that fails is reported as an error, not as a refusal by the user, and nothing is woken", !brokenDialog.ok && brokenDialog.code === "confirmation_failed" && !(await client.listSessions()).some((x) => x.piSessionId === brokenDialogTargetId), brokenDialog.code);
+
 // ---- Guards against the real daemon.
 const dup = await performWake(deps(), { to: dormantId, cwd: work, message: brief });
 check("the same message again is refused as a duplicate", !dup.ok && dup.code === "duplicate", dup.code);
 const missing = await performWake(deps(), { to: randomUUID(), cwd: work, message: "x1" });
 check("an unknown session is refused", !missing.ok && missing.code === "not_found", missing.code);
 const arch = await performWake(deps(), { to: archivedId, cwd: work, message: "x2" });
-check("an archived session is refused and not loaded", !arch.ok && arch.code === "archived" && (await daemon("GET", `/health`)).json.activeSessions === 2, arch.code);
+check("an archived session is refused and not loaded", !arch.ok && arch.code === "archived" && (await daemon("GET", `/health`)).json.activeSessions === 3, arch.code);
 const outside = await performWake(deps(), { to: dormantId, cwd: path.join(root, "elsewhere"), message: "x3" });
 check("a directory outside the allowlist is refused", !outside.ok && outside.code === "cwd_not_allowed", outside.code);
 const down = await performWake(deps(createSessiondProvider({ sessiondSocket: path.join(root, "no-such.sock") })), { to: dormantId, cwd: work, message: "x4" });
@@ -142,6 +153,61 @@ check("a secret-like message is refused", !secret.ok && secret.code === "possibl
 // ---- A connected target is not woken again by the same flow (the extension routes it to an ordinary send).
 const hold = await client.send(dormantId, { messageId: randomUUID(), text: "second brief, connected now", wake: { piSessionId: dormantId, cwd: work } });
 check("a wake send to the now-connected session is delivered normally", hold.delivered && hold.delivery === "socket_delivered", `${hold.delivery} ${hold.code ?? ""}`);
+
+// ---- spawn: a NEW session in a project, created through the daemon, receiving the task once.
+const activeBeforeSpawn = (await daemon("GET", `/health`)).json.activeSessions as number;
+const filesBeforeSpawn = readdirSync(path.dirname(dormantFile)).filter((f) => f.endsWith(".jsonl")).length;
+const noUi = await performWake(deps(), { to: "", cwd: work, message: "E2E spawn without a UI", spawn: true });
+check("spawn by default asks, and without a UI nothing is created", !noUi.ok && noUi.code === "confirmation_unavailable" && (await daemon("GET", `/health`)).json.activeSessions === activeBeforeSpawn, noUi.code);
+new WakeTrustStore(wakeTrustPath()).grant({ piSessionId: "e2e-sender-pi", cwd: root }, 1);
+const trustedNoUi = await performWake({ ...deps(), trust: new WakeTrustStore(wakeTrustPath()) }, { to: "", cwd: work, message: "E2E spawn trusted without a UI", spawn: true });
+check("a /wake-trust sender is still asked by default for spawn", !trustedNoUi.ok && trustedNoUi.code === "confirmation_unavailable", trustedNoUi.code);
+new WakeTrustStore(wakeTrustPath()).revoke("e2e-sender-pi");
+const spawnBrief = "E2E spawn brief: please acknowledge this task in one short sentence.";
+const spawned = await performWake(deps(undefined, { spawnConfirm: "never" }), { to: "", cwd: work, message: spawnBrief, spawn: true });
+check("spawn reports delivered", spawned.ok && spawned.outcome === "delivered" && Boolean(spawned.target?.piSessionId), `${spawned.outcome} (${spawned.code}) ${spawned.text}`);
+const newId = spawned.target?.piSessionId ?? "";
+check("exactly one new session was loaded by the daemon", (await daemon("GET", `/health`)).json.activeSessions === activeBeforeSpawn + 1);
+const roster2 = await client.listSessions();
+const created = roster2.find((s) => s.piSessionId === newId);
+check("the new session is on intercom in the requested project", Boolean(created) && created!.cwd === work, created ? `intercom id ${created.id}` : "absent");
+// The isolated daemon has no model, so the new session never answers and Pi never saves a file for it: read it back
+// from the daemon that holds it instead.
+await new Promise((r) => setTimeout(r, 2000));
+const newMessages = await daemon("GET", `/sessions/${encodeURIComponent(newId)}/messages?cwd=${encodeURIComponent(work)}`);
+const list = (newMessages.json?.messages ?? []) as Array<Record<string, any>>;
+const newInjected = list.filter((m) => m.role === "custom" && m.customType === "intercom_message");
+check("the task was injected exactly once", newMessages.status === 200 && newInjected.length === 1 && String(newInjected[0]!.content).includes("E2E spawn brief"), `status=${newMessages.status} count=${newInjected.length}`);
+check("the spawn prompt never became a user message", !list.some((m) => m.role === "user" && JSON.stringify(m.content).includes("/intercom-wake")), `${list.length} messages`);
+check("creating the session added no history file for the other sessions", readdirSync(path.dirname(dormantFile)).filter((f) => f.endsWith(".jsonl")).length === filesBeforeSpawn);
+const spawnAudit = readFileSync(wakeAuditPath(), "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+check("the audit records the spawn, who approved it, and no text", spawnAudit.some((e) => e.kind === "spawn" && e.outcome === "delivered" && e.confirmedBy === "config" && e.target.piSessionId === newId) && !JSON.stringify(spawnAudit).includes("E2E spawn brief"));
+const chained = await performWake({ ...deps(undefined, { spawnConfirm: "never" }), self: { intercomId: created?.id ?? null, piSessionId: newId, cwd: work } }, { to: "", cwd: work, message: "E2E spawn from the spawned session", spawn: true });
+check("a session created by spawn cannot spawn", !chained.ok && chained.code === "spawn_chain", chained.code);
+const outsideSpawn = await performWake(deps(undefined, { spawnConfirm: "never" }), { to: "", cwd: path.join(root, "elsewhere"), message: "E2E spawn outside", spawn: true });
+check("spawn outside the allowlist creates nothing", !outsideSpawn.ok && outsideSpawn.code === "cwd_not_allowed" && (await daemon("GET", `/health`)).json.activeSessions === activeBeforeSpawn + 1, outsideSpawn.code);
+
+// ---- archive: the whole flow against the real daemon, on a loaded, saved session that spawn "created" (seeded in the audit).
+const audit = new WakeAudit(wakeAuditPath());
+const archiveDeps = (confirm?: () => Promise<boolean>) => ({ config: { ...config, enabled: true }, provider: createSessiondProvider({ sessiondSocket: socket }), audit, ...(confirm ? { confirm } : {}), trust: new WakeTrustStore(wakeTrustPath()), self: { intercomId: client.sessionId, piSessionId: "e2e-sender-pi", cwd: root } });
+const notMine = await performArchive(archiveDeps(async () => true), { piSessionId: dormantId, cwd: work });
+check("archive refuses a session this sender did not create with spawn", !notMine.ok && notMine.code === "not_created_by_you", notMine.code);
+audit.append({ ts: Date.now(), kind: "spawn", outcome: "delivered", code: "delivered", messageId: randomUUID(), target: { piSessionId: dormantId, cwd: work }, sender: { piSessionId: "e2e-sender-pi" }, textLength: 1, textSha256: "x" });
+new WakeTrustStore(wakeTrustPath()).grant({ piSessionId: "e2e-sender-pi", cwd: root }, 1);
+const noUiArchive = await performArchive(archiveDeps(), { piSessionId: dormantId, cwd: work });
+check("archive without a UI is blocked, even with a /wake-trust grant and confirm never", !noUiArchive.ok && noUiArchive.code === "confirmation_unavailable", noUiArchive.code);
+new WakeTrustStore(wakeTrustPath()).revoke("e2e-sender-pi");
+const declined = await performArchive(archiveDeps(async () => false), { piSessionId: dormantId, cwd: work });
+const archivedNow = async () => ((await daemon("GET", `/sessions?cwd=${encodeURIComponent(work)}`)).json as any[]).filter((e) => e.archived === true).map((e) => e.id as string);
+check("a declined archive changes nothing", !declined.ok && declined.code === "user_declined" && !(await archivedNow()).includes(dormantId));
+const activeBeforeArchive = (await daemon("GET", `/health`)).json.activeSessions as number;
+const archivedResult = await performArchive(archiveDeps(async () => true), { piSessionId: dormantId, cwd: work });
+check("a confirmed archive archives the loaded session", archivedResult.ok && archivedResult.outcome === "archived" && (await archivedNow()).includes(dormantId), `${archivedResult.outcome} (${archivedResult.code}) ${archivedResult.text}`);
+check("the archived session was closed in the daemon", (await daemon("GET", `/health`)).json.activeSessions === activeBeforeArchive - 1);
+const wakeArchived = await performWake(deps(), { to: dormantId, cwd: work, message: "E2E wake after archive" });
+check("an archived session can no longer be woken", !wakeArchived.ok && wakeArchived.code === "archived", wakeArchived.code);
+const auditAfter = readFileSync(wakeAuditPath(), "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+check("the audit records the archive, approved by the user", auditAfter.some((e) => e.kind === "archive" && e.outcome === "archived" && e.confirmedBy === "user" && e.target.piSessionId === dormantId));
 
 await client.disconnect().catch(() => undefined);
 const failed = results.filter((r) => !r.ok);

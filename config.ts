@@ -51,6 +51,16 @@ export interface WakeConfig {
   allowCwds: string[];
   /** `always` asks the user before every wake (and blocks without UI); `never` skips the dialog for allowlisted directories. */
   confirm: "always" | "never";
+  /**
+   * Asking before `spawn` creates a session in another project. `always` (default) asks every time, trusted senders
+   * included, and blocks without a UI; `trusted` lets /wake-trust senders skip the dialog; `never` never asks.
+   */
+  spawnConfirm: "always" | "trusted" | "never";
+  /** At most this many sessions created by `spawn` per spawnWindowMs, across all senders. */
+  spawnMax: number;
+  spawnWindowMs: number;
+  /** At most this many `archive` actions per spawnWindowMs. Archiving always asks the user; this is not configurable. */
+  archiveMax: number;
   /** A wake with the same target and text inside this window is refused. */
   dedupMs: number;
   perTargetMax: number;
@@ -114,6 +124,10 @@ export const defaultWakeConfig = (): WakeConfig => ({
   provider: "pi-web-sessiond",
   allowCwds: [],
   confirm: "always",
+  spawnConfirm: "always",
+  spawnMax: 5,
+  spawnWindowMs: 60 * 60_000,
+  archiveMax: 10,
   dedupMs: 10 * 60_000,
   perTargetMax: 3,
   perTargetWindowMs: 10 * 60_000,
@@ -144,7 +158,7 @@ function parseWakeConfig(value: unknown): WakeConfig {
       wake[key] = raw[key] as boolean;
     }
   };
-  const positive = (key: "dedupMs" | "perTargetMax" | "perTargetWindowMs" | "globalMax" | "globalWindowMs" | "listTimeoutMs" | "wakeTimeoutMs" | "deliveryTimeoutMs" | "receiveTimeoutMs" | "auditMaxEntries" | "auditRetentionDays" | "trustDays") => {
+  const positive = (key: "dedupMs" | "perTargetMax" | "perTargetWindowMs" | "globalMax" | "globalWindowMs" | "listTimeoutMs" | "wakeTimeoutMs" | "deliveryTimeoutMs" | "receiveTimeoutMs" | "auditMaxEntries" | "auditRetentionDays" | "trustDays" | "spawnMax" | "spawnWindowMs" | "archiveMax") => {
     if (Object.hasOwn(raw, key)) {
       const n = raw[key];
       if (typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0) throw new Error(`"wake.${key}" must be a positive integer`);
@@ -166,7 +180,11 @@ function parseWakeConfig(value: unknown): WakeConfig {
     if (raw.confirm !== "always" && raw.confirm !== "never") throw new Error(`"wake.confirm" must be "always" or "never"`);
     wake.confirm = raw.confirm;
   }
-  for (const key of ["dedupMs", "perTargetMax", "perTargetWindowMs", "globalMax", "globalWindowMs", "listTimeoutMs", "wakeTimeoutMs", "deliveryTimeoutMs", "receiveTimeoutMs", "auditMaxEntries", "auditRetentionDays", "trustDays"] as const) positive(key);
+  if (raw.spawnConfirm !== undefined) {
+    if (raw.spawnConfirm !== "always" && raw.spawnConfirm !== "trusted" && raw.spawnConfirm !== "never") throw new Error(`"wake.spawnConfirm" must be "always", "trusted" or "never"`);
+    wake.spawnConfirm = raw.spawnConfirm;
+  }
+  for (const key of ["dedupMs", "perTargetMax", "perTargetWindowMs", "globalMax", "globalWindowMs", "listTimeoutMs", "wakeTimeoutMs", "deliveryTimeoutMs", "receiveTimeoutMs", "auditMaxEntries", "auditRetentionDays", "trustDays", "spawnMax", "spawnWindowMs", "archiveMax"] as const) positive(key);
   for (const key of ["sessiondSocket", "sessiondUrl"] as const) {
     if (Object.hasOwn(raw, key)) {
       if (typeof raw[key] !== "string" || !(raw[key] as string).trim()) throw new Error(`"wake.${key}" must be a non-empty string`);

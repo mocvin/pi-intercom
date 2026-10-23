@@ -14,7 +14,7 @@ import { EXTENSION_BUS_FEATURE } from "./types.ts";
 import "./wake/builtin.ts";
 import { WakeAudit, sha256, wakeAuditPath } from "./wake/audit.ts";
 import { WakeTrustStore, wakeTrustPath } from "./wake/trust.ts";
-import { findLiveWakeTarget, performWake, type WakeDeps } from "./wake/controller.ts";
+import { findLiveWakeTarget, performArchive, performWake, type WakeDeps } from "./wake/controller.ts";
 import { SAFE_MESSAGE_ID, WAKE_COMMAND, createWakeProvider } from "./wake/provider.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
 import {
@@ -2058,6 +2058,36 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       },
     };
   }
+  /** `spawn`: create a new session in another project and deliver the task to it, through the wake flow. */
+  async function spawnSessionAction(
+    connectedClient: IntercomClient,
+    ctx: ExtensionContext,
+    signal: AbortSignal | undefined,
+    request: { cwd: string; message: string },
+  ): Promise<IntercomToolResult> {
+    const targetCwd = resolvePath(ctx.cwd, request.cwd);
+    const result = await performWake(buildWakeDeps(connectedClient, ctx), { to: "", cwd: targetCwd, message: request.message, spawn: true, signal });
+    if (!result.ok) {
+      return { content: [{ type: "text", text: result.text }], details: { error: true, spawn: { outcome: result.outcome, code: result.code, piSessionId: result.target?.piSessionId }, messageId: result.messageId } };
+    }
+    pi.appendEntry("intercom_sent", {
+      to: result.target?.piSessionId ?? targetCwd,
+      message: { text: request.message },
+      messageId: result.messageId,
+      timestamp: Date.now(),
+      wake: { outcome: result.outcome, piSessionId: result.target?.piSessionId, spawn: true },
+    });
+    const held = result.outcome === "uncertain" || result.outcome === "accepted_unconfirmed";
+    return {
+      content: [{ type: "text", text: result.text }],
+      details: {
+        delivered: true,
+        delivery: held ? "queued" : "socket_delivered",
+        messageId: result.messageId,
+        spawn: { outcome: result.outcome, code: result.code, piSessionId: result.target?.piSessionId, cwd: targetCwd },
+      },
+    };
+  }
   /** Internal command run in a reopened session: connect to the broker and let the held message arrive. No model call. */
   async function runWakeCommand(args: string, ctx: ExtensionContext): Promise<void> {
     const messageId = args.trim();
@@ -2161,6 +2191,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       `Enabled: ${wake.enabled ? "yes" : "no"}`,
       `Provider: ${wake.provider}${createWakeProvider(wake.provider, {}) ? "" : " (not available)"}`,
       `Confirmation: ${wake.confirm}`,
+      `Creating sessions in other projects (spawn): asks ${wake.spawnConfirm === "always" ? "every time, trusted senders included" : wake.spawnConfirm === "trusted" ? "unless the sender has /wake-trust" : "never"}; at most ${wake.spawnMax} per ${Math.round(wake.spawnWindowMs / 60_000)} min`,
+      `Archiving a session created by spawn: always asks the user (not configurable); at most ${wake.archiveMax} per ${Math.round(wake.spawnWindowMs / 60_000)} min`,
       ...(() => {
         try {
           const grants = new WakeTrustStore(wakeTrustPath()).list();
@@ -2811,6 +2843,8 @@ Usage:
   intercom({ action: "send", to: "name-or-id", message: "..." })  → Send message
   intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
   intercom({ action: "send", to: "<full session id or unique name>", cwd: "/path", wakeIfDisconnected: true, message: "..." }) → If that persisted session is not connected, hold the message and reopen the session (opt-in, needs user confirmation)
+  intercom({ action: "spawn", cwd: "/path/of/another/project", message: "task for the new session" }) → Create a new session in that project and send it the task (opt-in, asks the user)
+  intercom({ action: "archive", to: "<full Pi session id>", cwd: "/path" }) → Archive a session you created with spawn (the user is always asked)
   intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
   intercom({ action: "handover", to: "name-or-id", message: "next task" }) → Summarize this session and hand it over; the receiver acts on it
   intercom({ action: "handover", cwd: "/path", openProjectPaneIfMissing: true }) → Hand over to the session in that project, opening a Herdr pane when needed
@@ -2822,8 +2856,8 @@ Usage:
       "Use to coordinate with other local pi sessions: list peers, send updates, ask for help, or check intercom connectivity.",
 
     parameters: Type.Object({
-      action: StringEnum(["list", "list-cwd", "send", "ask", "handover", "reply", "pending", "status", "cancel"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'handover', 'reply', 'pending', 'status', or 'cancel'. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
+      action: StringEnum(["list", "list-cwd", "send", "ask", "handover", "reply", "pending", "status", "cancel", "spawn", "archive"] as const, {
+        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'handover', 'reply', 'pending', 'status', 'cancel', 'spawn', or 'archive'. 'archive' archives (reversibly) a session that this session created with 'spawn': 'to' is its full Pi session id and 'cwd' its directory; the user is always asked and it is refused while the session works. 'spawn' creates a NEW session in another project ('cwd') and gives it 'message' as its task; it needs wake.enabled, the directory in wake.allowCwds, and by default asks the user every time; a session created by spawn cannot spawn. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
       }),
       to: Type.Optional(Type.String({
         description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
@@ -3012,6 +3046,43 @@ Usage:
           return deliverMessage(connectedClient, ctx, _signal, {
             to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf,
           });
+        }
+
+        case "spawn": {
+          if (!cwd || !message) {
+            return {
+              content: [{ type: "text", text: "spawn needs 'cwd' (the project directory) and 'message' (the task for the new session)." }],
+              details: { error: true },
+            };
+          }
+          if (to || replyTo || supersedes || retryOf || openProjectPaneIfMissing || attachments?.length) {
+            return {
+              content: [{ type: "text", text: "spawn takes only 'cwd' and 'message'. To reach an existing session use 'send' (with wakeIfDisconnected for a saved one)." }],
+              details: { error: true },
+            };
+          }
+          return spawnSessionAction(connectedClient, ctx, _signal, { cwd, message });
+        }
+
+        case "archive": {
+          if (!to || !cwd) {
+            return {
+              content: [{ type: "text", text: "archive needs 'to' (the full Pi session id of a session you created with spawn) and 'cwd' (its directory)." }],
+              details: { error: true },
+            };
+          }
+          if (message || replyTo || supersedes || retryOf || openProjectPaneIfMissing || attachments?.length) {
+            return {
+              content: [{ type: "text", text: "archive takes only 'to' and 'cwd'." }],
+              details: { error: true },
+            };
+          }
+          const { client: _unused, ...archiveDeps } = buildWakeDeps(connectedClient, ctx);
+          const archived = await performArchive(archiveDeps, { piSessionId: to, cwd: resolvePath(ctx.cwd, cwd), signal: _signal });
+          return {
+            content: [{ type: "text", text: archived.text }],
+            details: archived.ok ? { archived: true, piSessionId: archived.target.piSessionId } : { error: true, archive: { outcome: archived.outcome, code: archived.code } },
+          };
         }
 
         case "handover": {

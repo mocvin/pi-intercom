@@ -170,6 +170,40 @@ for (const method of methods) {
   note("S5 errors", "M2-commands", "missing session", `HTTP ${onMissing.status} ${JSON.stringify(onMissing.json)}`);
 }
 
+// ---- S6: archiving a session that spawn created (provider.archive), idle, working, and never answered.
+{
+  const archivedIds = async () => ((await daemon("GET", `/sessions?${q}`)).json as any[]).filter((e) => e.archived === true).map((e) => e.id as string);
+  const tryArchive = async (id: string) => { try { await provider.archive!({ piSessionId: id, cwd: work }); return "archived"; } catch (error) { return `${(error as { code?: string }).code ?? "error"}: ${(error as Error).message}`; } };
+
+  const idleId = await newSession();
+  await prompt(idleId, "hello");
+  await waitFor("idle session ready", async () => (await idle(idleId)) && transcript(idleId).some((e) => e.message?.role === "assistant"));
+  const idleResult = await tryArchive(idleId);
+  note("S6 archive", "provider", "idle loaded session", idleResult);
+  expect("S6: an idle loaded session is archived and the catalog lists it as archived", idleResult === "archived" && (await archivedIds()).includes(idleId));
+  const woken = await daemon("POST", `/sessions/${idleId}/commands/run`, { cwd: work, text: "/intercom-wake probe" });
+  note("S6 archive", "provider", "a command on the archived session", `HTTP ${woken.status} ${JSON.stringify(woken.json).slice(0, 100)}`);
+
+  const workingId = await newSession();
+  await prompt(workingId, "hello");
+  await waitFor("idle", () => idle(workingId));
+  await prompt(workingId, "SLOW work");
+  await waitFor("streaming", async () => (await status(workingId)).isStreaming === true);
+  const workingResult = await tryArchive(workingId);
+  note("S6 archive", "provider", "working session", workingResult);
+  await waitFor("turn finished", () => idle(workingId), 40_000);
+  await sleep(1500);
+  const finished = transcript(workingId).filter((e) => e.message?.role === "assistant").at(-1);
+  expect("S6: a working session is refused as busy, not archived, and its turn completes normally", workingResult.startsWith("busy") && !(await archivedIds()).includes(workingId) && finished?.message?.stopReason === "stop", `${workingResult} / ${finished?.message?.stopReason}`);
+  const retry = await tryArchive(workingId);
+  expect("S6: once it is idle the same session can be archived", retry === "archived" && (await archivedIds()).includes(workingId), retry);
+
+  const emptyId = await newSession();
+  const emptyResult = await tryArchive(emptyId);
+  note("S6 archive", "provider", "a new session that never answered (not persisted)", emptyResult);
+  expect("S6: a never-answered session is never reported archived unless the catalog says so", emptyResult !== "archived" || (await archivedIds()).includes(emptyId), emptyResult);
+}
+
 writeFileSync(path.join(root, "busy-result.json"), JSON.stringify({ failures, findings }, null, 2));
 console.log(`\n${failures.length ? `${failures.length} expectation(s) failed` : "all expectations met"}; findings in busy-result.json`);
 process.exit(failures.length ? 1 : 0);
