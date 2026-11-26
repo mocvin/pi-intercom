@@ -27,7 +27,7 @@ export default function fauxModel(pi: any): void {
     const lastText = typeof last?.content === "string" ? last.content : (last?.content ?? []).filter((p: any) => p.type === "text").map((p: any) => p.text).join("");
     const all = JSON.stringify(messages);
     const slow = lastText.includes("SLOW") || existsSync(join(root, "slow-all"));
-    appendFileSync(log, `${JSON.stringify({ t: Date.now(), lastUser: lastText.slice(0, 120), sawWakePrompt: all.includes("/intercom-wake"), slow })}\n`);
+    appendFileSync(log, `${JSON.stringify({ t: Date.now(), lastUser: lastText.slice(0, 120), sawWakePrompt: all.includes("/intercom-wake"), sawPeer: all.includes("From e2e-peer"), slow })}\n`);
     if (slow) await sleep(slowMs, options?.signal);
     if (lastText.includes("ASKFORM") && !messages.some((m) => m.role === "toolResult" && m.toolName === "ask_user")) {
       return fauxAssistantMessage(fauxToolCall("ask_user", { questions: [{ id: "q1", question: "Which option?", options: [{ value: "a", label: "A" }, { value: "b", label: "B" }] }] }), { stopReason: "toolUse" });

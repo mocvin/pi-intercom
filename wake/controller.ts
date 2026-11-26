@@ -9,6 +9,7 @@ import { WakeAudit, sha256, type WakeAuditEntry, type WakeOutcome } from "./audi
 import { checkArchiveLimit, checkLimits, checkMessage, checkSpawnLimit, clip, clipMiddle, createdBySpawn, cwdAllowed, dialogBody, findOwnSpawn } from "./policy.ts";
 import { SAFE_MESSAGE_ID, SAFE_SESSION_ID, WakeError, type WakeProvider } from "./provider.ts";
 import { resolveWakeCandidate } from "./resolve.ts";
+import type { OwnedChild } from "./children.ts";
 
 /** The slice of the intercom client the wake flow needs; the real IntercomClient satisfies it. */
 export interface WakeClient {
@@ -269,6 +270,13 @@ export function findLiveWakeTarget(sessions: SessionInfo[], to: string, cwd: str
     ?? inCwd.find((session) => session.name?.toLowerCase() === lower);
 }
 
+/** What archiving needs beyond a wake: the sender's own tracked subsessions, and (for the automatic path) its /archive-trust grant. */
+export interface ArchiveDeps extends Omit<WakeDeps, "client"> {
+  /** Direct tracked subsessions of the sender (spawn_subsession), read from its own entries. */
+  children?: OwnedChild[];
+  archiveTrust?: { find(piSessionId: string, now?: number): { expiresAt: number } | undefined };
+}
+
 export interface ArchiveRequest {
   piSessionId: string;
   cwd: string;
@@ -288,7 +296,7 @@ export interface ArchiveResult {
  * no setting and no /wake-trust grant removes the dialog, and without a UI nothing happens.
  * The host archives reversibly (nothing is deleted) and refuses a session that is working.
  */
-export async function performArchive(deps: Omit<WakeDeps, "client">, request: ArchiveRequest): Promise<ArchiveResult> {
+export async function performArchive(deps: ArchiveDeps, request: ArchiveRequest): Promise<ArchiveResult> {
   const { config, provider, audit } = deps;
   const now = deps.now ?? Date.now;
   const started = now();
@@ -334,10 +342,12 @@ export async function performArchive(deps: Omit<WakeDeps, "client">, request: Ar
   if (!deps.confirm) return blocked("confirmation_unavailable", "Archiving a session needs the user's confirmation, always, and no UI is available.");
 
   let spawned: WakeAuditEntry | undefined;
+  let tracked: OwnedChild | undefined;
   try {
     const entries = audit.read();
     spawned = findOwnSpawn(entries, deps.self.piSessionId, request.piSessionId, cwd);
-    if (!spawned) return blocked("not_created_by_you", "Only a session that this session created with spawn can be archived. Anything else is archived by the user in PI WEB.");
+    tracked = spawned ? undefined : deps.children?.find((child) => child.piSessionId === request.piSessionId && sameCwd(child.cwd, cwd));
+    if (!spawned && !tracked) return blocked("not_created_by_you", "Only a session that this session created with spawn, or one of its own tracked subsessions (spawn_subsession), can be archived. Anything else is archived by the user in PI WEB.");
     const limit = checkArchiveLimit(config, entries, now());
     if (limit) return blocked(limit.code, limit.detail);
   } catch (error) {
@@ -347,7 +357,7 @@ export async function performArchive(deps: Omit<WakeDeps, "client">, request: Ar
   const asked = await askUser(
     deps.confirm,
     "Archive a session?",
-    dialogBody(`Archive the session ${request.piSessionId} in ${clipMiddle(cwd, 160)}, which session ${clip(deps.self.intercomId ?? deps.self.piSessionId, 40)} created with spawn on ${new Date(spawned.ts).toISOString()}. It is closed and moved to the archive: nothing is deleted, and you can restore it in PI WEB. If it is working, the archive is refused.`, ""),
+    dialogBody(`Archive the session ${request.piSessionId} in ${clipMiddle(cwd, 160)}, ${spawned ? `which session ${clip(deps.self.intercomId ?? deps.self.piSessionId, 40)} created with spawn on ${new Date(spawned.ts).toISOString()}` : `one of the tracked subsessions of ${clip(deps.self.intercomId ?? deps.self.piSessionId, 40)} (spawn_subsession)`}. It is closed and moved to the archive: nothing is deleted, and you can restore it in PI WEB. If it is working, the archive is refused.`, ""),
   );
   if (asked === "failed") return blocked("confirmation_failed", "The confirmation dialog could not be shown, so nothing was archived. This is not a refusal by the user; try again, or tell the user.");
   if (asked === "declined") return done(false, "refused", "user_declined", "Archiving cancelled by the user.");
@@ -367,4 +377,227 @@ export async function performArchive(deps: Omit<WakeDeps, "client">, request: Ar
       : `The outcome is unknown (${archiveError.message}); check in PI WEB whether the session is archived.`);
   }
   return done(true, "archived", "archived", `Archived session ${request.piSessionId} in ${cwd}. It was closed and can be restored from the archive in PI WEB.`);
+}
+
+export interface ArchiveManyRequest {
+  ids: string[];
+  signal?: AbortSignal;
+}
+
+export interface ArchiveManyItem {
+  piSessionId: string;
+  cwd?: string;
+  name?: string;
+  ok: boolean;
+  code: string;
+  text: string;
+}
+
+export interface ArchiveManyResult {
+  ok: boolean;
+  code: string;
+  text: string;
+  results: ArchiveManyItem[];
+}
+
+export const MAX_ARCHIVE_BATCH = 10;
+
+function idleText(ms: number): string {
+  const minutes = Math.max(0, Math.round(ms / 60_000));
+  return minutes < 90 ? `${minutes}m` : minutes < 48 * 60 ? `${Math.round(minutes / 60)}h` : `${Math.round(minutes / 1440)}d`;
+}
+
+/**
+ * Archive several sessions with ONE confirmation that lists them. Only sessions this sender created with spawn or that are its own
+ * tracked subsessions; each must be saved, not archived yet, and idle for wake.archiveMinIdleMs. The host refuses a working
+ * session on its own, and each session gets its own result and audit entries. The user is always asked.
+ */
+export async function performArchiveMany(deps: ArchiveDeps, request: ArchiveManyRequest): Promise<ArchiveManyResult> {
+  const { config, provider, audit } = deps;
+  const now = deps.now ?? Date.now;
+  const started = now();
+  const ids = [...new Set(request.ids.map((id) => id.trim()).filter(Boolean))];
+  const results: ArchiveManyItem[] = [];
+  const entryFor = (id: string, cwd: string | undefined, name: string | undefined, outcome: WakeOutcome, code: string, detail: string, messageId: string = randomUUID()): WakeAuditEntry => ({
+    ts: now(), kind: "archive", outcome, code, messageId,
+    target: { piSessionId: id, ...(cwd ? { cwd } : {}), ...(name ? { name } : {}) },
+    sender: { ...(deps.self.intercomId ? { intercomId: deps.self.intercomId } : {}), piSessionId: deps.self.piSessionId, cwd: deps.self.cwd },
+    textLength: 0, textSha256: sha256(""), provider: provider?.id ?? config.provider, durationMs: now() - started, confirmedBy: "user", detail: detail.slice(0, 300),
+  });
+  const record = (...entries: WakeAuditEntry[]) => { try { for (const e of entries) audit.append(e); } catch { /* the outcome is reported; an audit write failure must not hide it */ } };
+  const stop = (code: string, text: string): ArchiveManyResult => {
+    record(entryFor(ids[0] ?? "", undefined, undefined, "blocked", code, text));
+    return { ok: false, code, text, results };
+  };
+
+  if (!config.enabled) return stop("wake_disabled", "Archiving is disabled. Set wake.enabled in the intercom config to allow it.");
+  if (!provider) return stop("provider_missing", `No wake provider "${config.provider}" is available.`);
+  if (!provider.archive || !provider.list) return stop("archive_unsupported", `The provider "${provider.id}" cannot archive sessions.`);
+  if (ids.length === 0) return stop("no_sessions", "archive needs at least one session id.");
+  if (ids.length > MAX_ARCHIVE_BATCH) return stop("too_many", `At most ${MAX_ARCHIVE_BATCH} sessions can be archived with one confirmation.`);
+  if (!deps.confirm) return stop("confirmation_unavailable", "Archiving sessions needs the user's confirmation, always, and no UI is available.");
+
+  // Who owns what: sessions this sender created with spawn (audit) or its tracked subsessions (its own entries).
+  let entries: WakeAuditEntry[];
+  try {
+    entries = audit.read();
+  } catch (error) {
+    return stop("audit_unavailable", `Cannot read the audit (${error instanceof Error ? error.message : String(error)}); not archiving.`);
+  }
+  const owned = new Map<string, string>();
+  for (const id of ids) {
+    const spawn = entries.find((e) => e.kind === "spawn" && e.outcome !== "attempting" && e.outcome !== "blocked" && e.outcome !== "refused" && e.target.piSessionId === id && e.sender.piSessionId === deps.self.piSessionId && e.target.cwd);
+    const child = deps.children?.find((c) => c.piSessionId === id);
+    const cwd = spawn?.target.cwd ?? child?.cwd;
+    if (cwd) owned.set(id, cwd);
+  }
+  const catalogs = new Map<string, Awaited<ReturnType<NonNullable<typeof provider.list>>>>();
+  const skip = (id: string, text: string, code: string, cwd?: string, name?: string) => results.push({ piSessionId: id, ...(cwd ? { cwd } : {}), ...(name ? { name } : {}), ok: false, code, text });
+  const eligible: Array<{ id: string; cwd: string; name?: string; idleMs: number }> = [];
+  for (const id of ids) {
+    const cwd = owned.get(id);
+    if (id === deps.self.piSessionId) { skip(id, "this is the current session", "self_target"); continue; }
+    if (!cwd) { skip(id, "not created by this session with spawn and not one of its tracked subsessions", "not_created_by_you"); continue; }
+    if (!cwdAllowed(config, cwd)) { skip(id, `${cwd} is not in wake.allowCwds`, "cwd_not_allowed", cwd); continue; }
+    if (!catalogs.has(cwd)) {
+      try {
+        catalogs.set(cwd, await provider.list(cwd, AbortSignal.any([AbortSignal.timeout(config.listTimeoutMs), ...(request.signal ? [request.signal] : [])])));
+      } catch (error) {
+        return stop(`provider_${error instanceof WakeError ? error.code : "unavailable"}`, `Cannot look up the sessions: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    const item = catalogs.get(cwd)!.find((c) => c.piSessionId === id);
+    if (!item || item.persisted === false) { skip(id, "not saved yet (it never answered), so it cannot be archived", "not_saved", cwd, item?.name); continue; }
+    if (item.archived) { skip(id, "already archived", "already_archived", cwd, item.name); continue; }
+    const modified = item.modified ? Date.parse(item.modified) : NaN;
+    if (!Number.isFinite(modified)) { skip(id, "its last activity is unknown", "unknown_activity", cwd, item.name); continue; }
+    const idleMs = now() - modified;
+    if (idleMs < config.archiveMinIdleMs) { skip(id, `active ${idleText(idleMs)} ago; wait until it has been idle for ${idleText(config.archiveMinIdleMs)}`, "too_recent", cwd, item.name); continue; }
+    eligible.push({ id, cwd, ...(item.name ? { name: item.name } : {}), idleMs });
+  }
+  const summarize = (): string => results.map((r) => `- ${r.name ? `"${clip(r.name, 40)}" ` : ""}${r.piSessionId}: ${r.ok ? "archived" : r.text}`).join("\n");
+  if (eligible.length === 0) return stop("nothing_to_archive", `None of the ${ids.length} session(s) can be archived:\n${summarize()}`);
+
+  const recent = entries.filter((e) => e.kind === "archive" && e.outcome === "attempting" && now() - e.ts < config.spawnWindowMs).length;
+  if (recent + eligible.length > config.archiveMax) {
+    return stop("rate_limited_archive", `At most ${config.archiveMax} sessions can be archived per ${Math.round(config.spawnWindowMs / 60_000)} minutes (${recent} already in this window).`);
+  }
+
+  const list = eligible.map((e) => `- ${clip(e.name ?? "(unnamed)", 40)} · ${e.id.slice(0, 13)} · idle ${idleText(e.idleMs)}`).join("\n");
+  const asked = await askUser(deps.confirm, `Archive ${eligible.length} session${eligible.length === 1 ? "" : "s"}?`, dialogBody(`Requested by ${clip(deps.self.intercomId ?? deps.self.piSessionId, 40)}. They are closed and moved to the archive: nothing is deleted, and you can restore them in PI WEB. A session that is working is refused.`, list));
+  if (asked === "failed") return stop("confirmation_failed", "The confirmation dialog could not be shown, so nothing was archived. This is not a refusal by the user; try again, or tell the user.");
+  if (asked === "declined") {
+    record(...eligible.map((e) => entryFor(e.id, e.cwd, e.name, "refused", "user_declined", "Archiving cancelled by the user.")));
+    return { ok: false, code: "user_declined", text: "Archiving cancelled by the user.", results };
+  }
+
+  // One audit reservation per session before the host is asked, so the limit counts them even if this process stops.
+  const reserved = new Map<string, string>();
+  try {
+    for (const e of eligible) { const messageId = randomUUID(); reserved.set(e.id, messageId); audit.append(entryFor(e.id, e.cwd, e.name, "attempting", "reserved", "reserved", messageId)); }
+  } catch (error) {
+    return stop("audit_unavailable", `Cannot record the archive in the audit (${error instanceof Error ? error.message : String(error)}); not archiving.`);
+  }
+  for (const e of eligible) {
+    try {
+      await provider.archive({ piSessionId: e.id, cwd: e.cwd }, AbortSignal.any([AbortSignal.timeout(config.wakeTimeoutMs), ...(request.signal ? [request.signal] : [])]));
+      record(entryFor(e.id, e.cwd, e.name, "archived", "archived", "archived", reserved.get(e.id)));
+      results.push({ piSessionId: e.id, cwd: e.cwd, ...(e.name ? { name: e.name } : {}), ok: true, code: "archived", text: "archived" });
+    } catch (error) {
+      const archiveError = error instanceof WakeError ? error : new WakeError("timeout", error instanceof Error ? error.message : String(error));
+      const text = archiveError.definitive ? archiveError.message : `outcome unknown (${archiveError.message}); check in PI WEB`;
+      record(entryFor(e.id, e.cwd, e.name, "failed", `provider_${archiveError.code}`, text, reserved.get(e.id)));
+      results.push({ piSessionId: e.id, cwd: e.cwd, ...(e.name ? { name: e.name } : {}), ok: false, code: `provider_${archiveError.code}`, text });
+    }
+  }
+  const archivedCount = results.filter((r) => r.ok).length;
+  return {
+    ok: archivedCount > 0,
+    code: archivedCount === eligible.length && results.length === eligible.length ? "archived" : archivedCount > 0 ? "partly_archived" : "not_archived",
+    text: `Archived ${archivedCount} of ${ids.length} session(s); they were closed and can be restored from the archive in PI WEB.\n${summarize()}`,
+    results,
+  };
+}
+
+export interface AutoArchiveCandidateInput {
+  piSessionId: string;
+  cwd: string;
+  name?: string;
+}
+
+export interface AutoArchiveItem {
+  piSessionId: string;
+  cwd: string;
+  name?: string;
+  outcome: "archived" | "busy" | "failed" | "skipped";
+  code: string;
+  /** True when the caller should stop retrying this session. */
+  giveUp: boolean;
+}
+
+export const AUTO_ARCHIVE_PER_TICK = 3;
+export const AUTO_ARCHIVE_GIVE_UP_AFTER = 3;
+
+/**
+ * Archive finished tracked subsessions of this session WITHOUT asking, because the user allowed it with /archive-trust and
+ * turned wake.autoArchive on. Both are required: the global setting alone grants nothing, and a /wake-trust grant is not
+ * consulted. Candidates are chosen by selectAutoArchiveCandidates; this checks the permission again, enforces the hourly cap,
+ * asks the host (which refuses a working session: retried later, silently), and audits every archive.
+ */
+export async function performAutoArchive(
+  deps: ArchiveDeps & { attempts: Map<string, number> },
+  request: { candidates: AutoArchiveCandidateInput[]; signal?: AbortSignal },
+): Promise<{ code: string; items: AutoArchiveItem[] }> {
+  const { config, provider, audit } = deps;
+  const now = deps.now ?? Date.now;
+  const items: AutoArchiveItem[] = [];
+  if (!config.enabled) return { code: "wake_disabled", items };
+  if (config.autoArchive !== "trusted-children") return { code: "auto_archive_off", items };
+  if (!deps.archiveTrust?.find(deps.self.piSessionId, now())) return { code: "not_trusted", items };
+  if (!provider?.archive) return { code: "archive_unsupported", items };
+
+  let archivedRecently: number;
+  try {
+    archivedRecently = audit.read().filter((e) => e.kind === "archive_auto" && e.outcome === "archived" && now() - e.ts < config.spawnWindowMs).length;
+  } catch {
+    return { code: "audit_unavailable", items };
+  }
+  let room = Math.min(AUTO_ARCHIVE_PER_TICK, Math.max(0, config.autoArchiveMax - archivedRecently));
+  if (room === 0 && request.candidates.length > 0) return { code: "rate_limited_auto_archive", items };
+
+  const entryFor = (c: AutoArchiveCandidateInput, outcome: WakeOutcome, code: string, detail: string): WakeAuditEntry => ({
+    ts: now(), kind: "archive_auto", outcome, code, messageId: randomUUID(),
+    target: { piSessionId: c.piSessionId, cwd: c.cwd, ...(c.name ? { name: c.name } : {}) },
+    sender: { ...(deps.self.intercomId ? { intercomId: deps.self.intercomId } : {}), piSessionId: deps.self.piSessionId, cwd: deps.self.cwd },
+    textLength: 0, textSha256: sha256(""), provider: provider.id, confirmedBy: "archive-trust", detail: detail.slice(0, 300),
+  });
+  const record = (entry: WakeAuditEntry) => { try { audit.append(entry); } catch { /* reported to the caller anyway */ } };
+
+  for (const candidate of request.candidates) {
+    if (room === 0) break;
+    const base = { piSessionId: candidate.piSessionId, cwd: candidate.cwd, ...(candidate.name ? { name: candidate.name } : {}) };
+    if (candidate.piSessionId === deps.self.piSessionId || !cwdAllowed(config, candidate.cwd)) {
+      items.push({ ...base, outcome: "skipped", code: candidate.piSessionId === deps.self.piSessionId ? "self_target" : "cwd_not_allowed", giveUp: true });
+      continue;
+    }
+    try {
+      await provider.archive({ piSessionId: candidate.piSessionId, cwd: candidate.cwd }, AbortSignal.any([AbortSignal.timeout(config.wakeTimeoutMs), ...(request.signal ? [request.signal] : [])]));
+      deps.attempts.delete(candidate.piSessionId);
+      record(entryFor(candidate, "archived", "archive_auto", `archived by ${deps.self.piSessionId} under /archive-trust`));
+      items.push({ ...base, outcome: "archived", code: "archive_auto", giveUp: false });
+      room -= 1;
+    } catch (error) {
+      const archiveError = error instanceof WakeError ? error : new WakeError("timeout", error instanceof Error ? error.message : String(error));
+      if (archiveError.code === "busy") {
+        items.push({ ...base, outcome: "busy", code: "provider_busy", giveUp: false });
+        continue;
+      }
+      const tries = (deps.attempts.get(candidate.piSessionId) ?? 0) + 1;
+      deps.attempts.set(candidate.piSessionId, tries);
+      const giveUp = tries >= AUTO_ARCHIVE_GIVE_UP_AFTER;
+      if (giveUp) record(entryFor(candidate, "failed", `provider_${archiveError.code}`, `gave up after ${tries} attempts: ${archiveError.message}`));
+      items.push({ ...base, outcome: "failed", code: `provider_${archiveError.code}`, giveUp });
+    }
+  }
+  return { code: "ok", items };
 }

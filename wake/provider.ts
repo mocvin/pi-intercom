@@ -8,6 +8,11 @@ export interface WakeCandidate {
   archived: boolean;
   modified?: string;
   messageCount?: number;
+  /** Saved file of the session, and of its parent when it is a subsession (catalog fields, read-only). */
+  path?: string;
+  parentSessionPath?: string;
+  /** False for a session that is active but has no saved file yet (PI WEB 1.202610.2 and newer list those too). */
+  persisted?: boolean;
 }
 
 export type WakeErrorCode =
@@ -58,6 +63,13 @@ export interface WakeProvider {
    * session that is working. Resolves only when the host confirms that this session is archived.
    */
   archive?(target: { piSessionId: string; cwd: string }, signal?: AbortSignal): Promise<void>;
+  /** Optional: the host's runtime version (for example 1.202610.8), or undefined when it does not say. Read-only. */
+  runtimeVersion?(signal?: AbortSignal): Promise<string | undefined>;
+  /**
+   * Optional: whether the host has a form (ask_user) open for a session that is loaded. Read-only: it must not open a session.
+   * Throws a WakeError when the host cannot tell.
+   */
+  pendingAsk?(target: { piSessionId: string; cwd: string }, signal?: AbortSignal): Promise<{ open: boolean; askId?: string }>;
   /** Short diagnostic description of the host (for example its version), for the audit and status output. */
   describe?(): string | undefined;
 }

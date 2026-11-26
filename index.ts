@@ -1,4 +1,4 @@
-import { BorderedLoader, defineTool, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, defineTool, getAgentDir, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import { Type } from "typebox";
@@ -9,12 +9,17 @@ import { SessionListOverlay, type SessionListSelection } from "./ui/session-list
 import { HandoverPicker, type HandoverPickerResult, type RemoteSessionLister } from "./ui/handover-picker.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
-import { getAskTimeoutMs, getIntercomScopeId, loadConfig, setIntercomScopeId, type IntercomConfig } from "./config.ts";
+import { getAskTimeoutMs, getIntercomScopeId, loadConfig, resolveShowInChat, setIntercomScopeId, type IntercomConfig } from "./config.ts";
 import { EXTENSION_BUS_FEATURE } from "./types.ts";
 import "./wake/builtin.ts";
 import { WakeAudit, sha256, wakeAuditPath } from "./wake/audit.ts";
 import { WakeTrustStore, wakeTrustPath } from "./wake/trust.ts";
-import { findLiveWakeTarget, performArchive, performWake, type WakeDeps } from "./wake/controller.ts";
+import { askModelOf, decideShield, findOpenAsk, isUrgentMessage, type DaemonVerdict } from "./ask-shield.ts";
+import { PeerTracker, TRACE_SCHEMA_VERSION, extractThreadRef, recipientInfo, threadReplyHint, type RecipientInfo } from "./trace-data.ts";
+import { ArchiveTrustStore, archiveTrustPath } from "./wake/archive-trust.ts";
+import { clip } from "./wake/policy.ts";
+import { KEEP_ENTRY, completionTimes, keptChildren, readChildHeader, selectAutoArchiveCandidates, trackedChildren, type OwnedChild } from "./wake/children.ts";
+import { findLiveWakeTarget, MAX_ARCHIVE_BATCH, performArchive, performArchiveMany, performAutoArchive, performWake, type ArchiveDeps, type WakeDeps } from "./wake/controller.ts";
 import { SAFE_MESSAGE_ID, WAKE_COMMAND, createWakeProvider } from "./wake/provider.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
 import {
@@ -77,6 +82,8 @@ interface InboundMessageEntry {
   from: SessionInfo;
   message: Message;
   replyCommand?: string;
+  /** How to answer a plain message in the same thread (model-facing text only; asks use replyCommand). */
+  threadReplyCommand?: string;
   bodyText: string;
 }
 
@@ -693,6 +700,9 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   let client: IntercomClient | null = null;
   const wakeWithTriggerTurn = triggerTurnRunsPromptLifecycle(piVersion);
   const config: IntercomConfig = loadConfig();
+  // /intercom-debug on|off overrides config and PI_INTERCOM_DEBUG for this session only (not persisted).
+  let showInChatOverride: boolean | undefined;
+  const showInChat = () => resolveShowInChat(config.showInChat, showInChatOverride);
   const askTimeoutMs = getAskTimeoutMs();
   const localExtensions = new Map<string, {
     registration: IntercomExtensionRegistration;
@@ -707,6 +717,19 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   let sessionStartedAt: number | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
   let namePollTimer: NodeJS.Timeout | null = null;
+  const peerTracker = new PeerTracker();
+  // Open ask_user forms (see ask-shield.ts): what the session daemon last said about them, and when this runtime started.
+  const askVerdicts = new Map<string, DaemonVerdict>();
+  let askVerifying = false;
+  // Which form model the session daemon uses; the shield only exists for the old one (see ask-shield.ts). Unknown = off.
+  let askModel: "legacy" | "durable" | undefined;
+  let askModelDetecting = false;
+  let runtimeStartedAt = Date.now();
+  const shieldNote = { at: 0, count: 0 };
+  let autoArchiveTimer: NodeJS.Timeout | null = null;
+  let autoArchiveBusy = false;
+  const autoArchiveAttempts = new Map<string, number>();
+  const autoArchiveGaveUp = new Set<string>();
   let lastPresenceName: string | null = null;
   let lastPresenceRuntimeFallbackAlias: boolean | null = null;
   const previousIntercomSessionId = process.env[INTERCOM_SESSION_ID_ENV];
@@ -859,6 +882,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
     clearTimeout(startupConnectTimer);
     startupConnectTimer = null;
+  }
+  function clearAutoArchiveTimer(): void {
+    if (autoArchiveTimer) clearInterval(autoArchiveTimer);
+    autoArchiveTimer = null;
   }
   function clearNamePollTimer(): void {
     if (!namePollTimer) {
@@ -1290,13 +1317,15 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           settleOutboxRequest(request.requestId, "failed", { code: "delivery_failed", messageId: result.id, detail: result.reason ?? "Delivery failed" });
           return;
         }
-        pi.appendEntry("intercom_sent", {
+        appendSent({
           to: target.label,
           message: { text: request.message },
           messageId: result.id,
           timestamp: Date.now(),
+          delivery: result.delivery,
+          recipient: (await lookupRecipient(activeClient, target.id)) ?? { id: target.id },
           extension: { id: request.extensionId, name: request.extensionName, requestId: request.requestId },
-        });
+        }, target.id);
         settleOutboxRequest(request.requestId, "sent", { messageId: result.id });
       } catch (error) {
         const live = getLiveContext(liveContext, outboxGeneration);
@@ -1319,6 +1348,87 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
     return false;
   }
+  /** What PI WEB does with forms, from its runtime version; PI_INTERCOM_ASK_MODEL (legacy|durable) overrides it for tests. */
+  async function detectAskModel(ctx: ExtensionContext, generation: number): Promise<void> {
+    if (askModel !== undefined || askModelDetecting) return;
+    const forced = process.env.PI_INTERCOM_ASK_MODEL;
+    if (forced === "legacy" || forced === "durable") { askModel = forced; return; }
+    askModelDetecting = true;
+    try {
+      if (!getLiveContext(ctx, generation)) return;
+      const wake = config.wake;
+      const provider = createWakeProvider(wake.provider, {
+        ...(wake.sessiondSocket ? { sessiondSocket: wake.sessiondSocket } : {}),
+        ...(wake.sessiondUrl ? { sessiondUrl: wake.sessiondUrl } : {}),
+      });
+      askModel = askModelOf(await provider?.runtimeVersion?.(AbortSignal.timeout(5000)));
+    } catch {
+      // The daemon cannot be reached or does not say: the shield stays off.
+    } finally {
+      askModelDetecting = false;
+    }
+  }
+  /** Ask the session daemon whether the form found in this session's entries is really open (read-only, about this session only). */
+  async function verifyOpenAsk(ctx: ExtensionContext, generation: number): Promise<void> {
+    if (askVerifying) return;
+    askVerifying = true;
+    try {
+      const live = getLiveContext(ctx, generation);
+      if (!live || askModel !== "legacy") return;
+      const open = findOpenAsk(live.sessionManager.getEntries());
+      if (!open) return;
+      const wake = config.wake;
+      const provider = createWakeProvider(wake.provider, {
+        ...(wake.sessiondSocket ? { sessiondSocket: wake.sessiondSocket } : {}),
+        ...(wake.sessiondUrl ? { sessiondUrl: wake.sessiondUrl } : {}),
+      });
+      if (!provider?.pendingAsk) return;
+      const answer = await provider.pendingAsk({ piSessionId: live.sessionManager.getSessionId(), cwd: live.cwd }, AbortSignal.timeout(5000));
+      askVerdicts.set(open.askId, { open: answer.open && answer.askId === open.askId, ...(answer.askId ? { askId: answer.askId } : {}), at: Date.now() });
+      while (askVerdicts.size > 20) askVerdicts.delete(askVerdicts.keys().next().value as string);
+    } catch {
+      // The daemon cannot tell (no endpoint, old PI WEB): the entries alone decide.
+    } finally {
+      askVerifying = false;
+    }
+  }
+  /** Whether this message must not start a turn because a form is open (see ask-shield.ts). */
+  function shieldedByOpenAsk(entry: InboundMessageEntry, generation: number): { shielded: boolean; askId?: string; urgent: boolean } {
+    const urgent = isUrgentMessage(entry.message.content.text);
+    const live = getLiveContext(runtimeContext, generation);
+    if (!live) return { shielded: false, urgent };
+    if (askModel === undefined) void detectAskModel(live, generation);
+    try {
+      const decision = decideShield({
+        entries: live.sessionManager.getEntries(),
+        now: Date.now(),
+        runtimeStartedAt,
+        verdicts: askVerdicts,
+        options: { askModel, enabled: config.shieldOpenAsk, maxAgeMs: config.shieldMaxAgeMs, verdictTtlMs: 60_000 },
+      });
+      if (decision.needsVerification) void verifyOpenAsk(live, generation);
+      if (!decision.shield) return { shielded: false, urgent };
+      if (urgent && config.shieldUrgent === "trigger") return { shielded: false, urgent };
+      return { shielded: true, ...(decision.askId ? { askId: decision.askId } : {}), urgent };
+    } catch {
+      return { shielded: false, urgent };
+    }
+  }
+  function noteShieldedMessage(entry: InboundMessageEntry, urgent: boolean, generation: number): void {
+    const live = getLiveContext(runtimeContext, generation);
+    if (!live) return;
+    const sender = entry.from.name || entry.from.id.slice(0, 8);
+    shieldNote.count += 1;
+    if (urgent) {
+      notifyIfLive(live, `URGENT message from ${sender} is waiting: your questions are open, so it did not interrupt them. It is in the transcript.`, "warning", generation);
+      return;
+    }
+    const now = Date.now();
+    if (now - shieldNote.at < 60_000) return;
+    shieldNote.at = now;
+    notifyIfLive(live, `${shieldNote.count} intercom message${shieldNote.count === 1 ? "" : "s"} waiting while your questions are open (latest from ${sender}). They are in the transcript and will be in context when you answer.`, "info", generation);
+    shieldNote.count = 0;
+  }
   function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration, forceTrigger = false): void {
     if (runtimeStarted && !getLiveContext(runtimeContext, generation)) {
       emitMessageReceipt(entry.message.id, "expired", "session context no longer active before injection");
@@ -1328,21 +1438,26 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     const replyCommand = delivery === "steer" && entry.replyCommand && entry.message.expectsReply
       ? `intercom({ action: "reply", replyTo: ${JSON.stringify(entry.message.id)}, message: "..." })`
       : entry.replyCommand;
-    const deliveredEntry = { ...entry, message: injectedMessage, replyCommand };
+    // A form is open: the message waits in the transcript and does not start a turn, which would cancel the form.
+    const shield = delivery === "trigger" ? shieldedByOpenAsk(entry, generation) : { shielded: false, urgent: false } as { shielded: boolean; askId?: string; urgent: boolean };
+    const deliveredEntry = { ...entry, message: injectedMessage, replyCommand, ...(shield.shielded && shield.askId ? { queuedBehindAsk: shield.askId } : {}) };
     replyTracker.queueTurnContext({ from: entry.from, message: injectedMessage, receivedAt: Date.now() });
     const senderDisplay = injectedMessage.crossMachine
       ? `${relaySenderName(injectedMessage.crossMachine.origin)} · unverified cross-machine`
       : entry.from.name || entry.from.id.slice(0, 8);
-    const replyInstruction = replyCommand ? `\n\nTo reply, use the intercom tool: ${replyCommand}` : "";
+    const replyInstruction = replyCommand
+      ? `\n\nTo reply, use the intercom tool: ${replyCommand}`
+      : entry.threadReplyCommand ? `\n\nTo answer this message in the same thread, begin your answer with its tag: ${entry.threadReplyCommand}` : "";
     const deliveryMetadata = formatInboundDeliveryMetadata(injectedMessage);
-    const trigger = delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger);
+    const trigger = delivery === "trigger" && !shield.shielded && shouldTriggerInboundMessage(entry, forceTrigger);
     const triggerContext = trigger ? getLiveContext(runtimeContext, generation) : undefined;
     const startTurn = wakeWithTriggerTurn && triggerContext?.isIdle() === true;
     pi.sendMessage(
       {
         customType: "intercom_message",
         content: `**From ${senderDisplay}** (${entry.from.cwd})${replyInstruction}\n\n_${deliveryMetadata}_\n\n${entry.bodyText}`,
-        display: true,
+        // Service traffic: always delivered to the model and kept in the session, rendered in the chat only when asked for.
+        display: showInChat(),
         details: deliveredEntry,
       },
       startTurn ? { triggerTurn: true } : trigger ? undefined : { deliverAs: "steer" }
@@ -1353,7 +1468,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       reserveIdleWake(triggerContext.sessionManager);
       pi.sendUserMessage("New intercom message above.", { deliverAs: "steer" });
     }
-    emitMessageReceipt(injectedMessage.id, "injected");
+    emitMessageReceipt(injectedMessage.id, "injected", shield.shielded ? "queued behind an open ask_user form: no turn was started" : undefined);
+    if (shield.shielded) noteShieldedMessage(entry, shield.urgent, generation);
   }
   function sendIncomingBrokerMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration): void {
     sendIncomingMessage(entry, delivery, generation);
@@ -1445,8 +1561,13 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         ? `intercom({ action: "reply", message: "..." })`
         : undefined;
     replyTracker.recordIncomingMessage(from, receivedMessage, receiverReceivedAt);
+    peerTracker.recordInbound(from.id, receivedMessage.id, receiverReceivedAt, Boolean(receivedMessage.expectsReply));
     emitMessageReceipt(receivedMessage.id, "acknowledged", "accepted by receiver");
-    const entry = { from, message: receivedMessage, replyCommand, bodyText };
+    // Plain messages used to carry no way to answer them in the same thread, so models answered with unthreaded sends.
+    const threadReplyCommand = config.replyHint && !receivedMessage.crossMachine && !receivedMessage.expectsReply
+      ? threadReplyHint(from.id, receivedMessage.id)
+      : undefined;
+    const entry = { from, message: receivedMessage, replyCommand, threadReplyCommand, bodyText };
     // Busy without an agent run cannot steer; manual compaction can discard an appended custom entry.
     if (heldInboundMessages.length > 0 || (!liveContext.isIdle() && (!agentRunning || (config.busyDelivery === "human-first" && liveContext.hasUI)))) {
       holdIncomingBrokerMessage(entry, liveContext, messageGeneration);
@@ -1455,6 +1576,23 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
   }
   function attachClientHandlers(nextClient: IntercomClient): void {
+    // Receipts used to be dropped; keep them in the session so a tracer can see the outcome. The broker only routes a receipt
+    // to the session that sent the message, and receipts can arrive before the sent entry is written: join them by messageId.
+    nextClient.onMessageReceipt((receiver, receipt) => {
+      if (client !== nextClient) return;
+      try {
+        pi.appendEntry("intercom_receipt", {
+          v: TRACE_SCHEMA_VERSION,
+          messageId: receipt.messageId,
+          status: receipt.status,
+          timestamp: receipt.timestamp,
+          ...(receipt.detail ? { detail: receipt.detail } : {}),
+          from: recipientInfo(receiver),
+        });
+      } catch {
+        // A receipt that cannot be recorded must never disturb the session.
+      }
+    });
     nextClient.onBrokerMessage((message: BrokerMessage) => {
       if (client !== nextClient) return;
       switch (message.type) {
@@ -1894,7 +2032,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
             remoteCommand: config.crossMachine.remoteCommand,
           });
           const remoteTarget = relaySenderName({ name: remote.agent.name, machine: remote.machine.label });
-          pi.appendEntry("intercom_sent", {
+          appendSent({
             to: remoteTarget,
             message: { text: message },
             timestamp: Date.now(),
@@ -1960,12 +2098,19 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           details: { ...deliveryDetails(result), ...(noMatchText ? { error: true } : {}) },
         };
       }
-      pi.appendEntry("intercom_sent", {
+      // A best guess about what a plain send answers, kept ONLY in this entry: a wrong replyTo on the wire could satisfy an ask.
+      const threadRef = effectiveReplyTo || request.handover ? undefined : extractThreadRef(message);
+      const inferredReply = effectiveReplyTo || request.handover || threadRef ? undefined : peerTracker.inferReply(sendTo, Date.now());
+      appendSent({
         to: display,
         message: { text: message, attachments, replyTo: effectiveReplyTo, supersedes, retryOf },
         messageId: result.id,
         timestamp: Date.now(),
-      });
+        delivery: result.delivery,
+        recipient: (await lookupRecipient(connectedClient, sendTo)) ?? { id: sendTo },
+        ...(threadRef ? { threadRef: { id: threadRef, source: "text_tag", fromThisPeer: peerTracker.receivedFrom(sendTo, threadRef) } } : {}),
+        ...(inferredReply ? { replyToInferred: inferredReply } : {}),
+      }, sendTo);
       if (effectiveReplyTo) {
         dismissIncomingAsk(effectiveReplyTo);
       }
@@ -2012,6 +2157,98 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       self: { intercomId: connectedClient.sessionId, piSessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd },
     };
   }
+  /**
+   * Record an outgoing message in the session's own entries (schema v1, see trace-data.ts) and note that this session wrote
+   * to the peer.
+   */
+  function appendSent(data: { messageId?: string; [key: string]: unknown }, peerId?: string): void {
+    pi.appendEntry("intercom_sent", { v: TRACE_SCHEMA_VERSION, ...data });
+    if (peerId) peerTracker.recordOutbound(peerId, Date.now());
+  }
+  /** Who a message went to, from the roster; best effort and quick, never a reason to fail a send. */
+  async function lookupRecipient(connectedClient: IntercomClient, id: string): Promise<RecipientInfo | undefined> {
+    try {
+      const session = (await connectedClient.listSessions({ timeoutMs: 1000 })).find((candidate) => candidate.id === id);
+      return session ? recipientInfo(session) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  /** Direct tracked subsessions (spawn_subsession) of this session, from its own entries, with their directories. */
+  function ownedChildren(ctx: ExtensionContext): OwnedChild[] {
+    const selfId = ctx.sessionManager.getSessionId();
+    const root = joinPath(getAgentDir(), "sessions");
+    const owned: OwnedChild[] = [];
+    for (const child of trackedChildren(ctx.sessionManager.getEntries(), selfId)) {
+      const header = readChildHeader(child, selfId, root);
+      if (header) owned.push({ piSessionId: child.piSessionId, cwd: header.cwd, file: child.file, via: "subsession" });
+    }
+    return owned;
+  }
+  function buildArchiveDeps(ctx: ExtensionContext): ArchiveDeps {
+    const wake = config.wake;
+    return {
+      config: wake,
+      provider: createWakeProvider(wake.provider, {
+        ...(wake.sessiondSocket ? { sessiondSocket: wake.sessiondSocket } : {}),
+        ...(wake.sessiondUrl ? { sessiondUrl: wake.sessiondUrl } : {}),
+      }),
+      audit: new WakeAudit(wakeAuditPath(), wake.auditMaxEntries, wake.auditRetentionDays * 24 * 60 * 60 * 1000),
+      ...(ctx.hasUI ? { confirm: (title: string, body: string) => ctx.ui.confirm(title, body) } : {}),
+      self: { intercomId: client?.sessionId ?? null, piSessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd },
+      children: ownedChildren(ctx),
+      archiveTrust: new ArchiveTrustStore(archiveTrustPath()),
+    };
+  }
+  /** One round of automatic archiving of this session's finished tracked subsessions (needs wake.autoArchive and /archive-trust). */
+  async function autoArchiveTick(ctx: ExtensionContext, generation: number): Promise<void> {
+    if (autoArchiveBusy) return;
+    autoArchiveBusy = true;
+    try {
+      const live = getLiveContext(ctx, generation);
+      if (!live || !config.wake.enabled || config.wake.autoArchive !== "trusted-children") return;
+      const selfId = live.sessionManager.getSessionId();
+      if (!new ArchiveTrustStore(archiveTrustPath()).find(selfId)) return;
+      const deps = buildArchiveDeps(live);
+      const children = deps.children ?? [];
+      if (children.length === 0 || !deps.provider?.list) return;
+      const catalogs = new Map<string, Awaited<ReturnType<NonNullable<typeof deps.provider.list>>>>();
+      for (const cwd of new Set(children.map((child) => child.cwd))) {
+        catalogs.set(cwd, await deps.provider.list(cwd, AbortSignal.timeout(config.wake.listTimeoutMs)));
+      }
+      const entries = live.sessionManager.getEntries();
+      const { candidates } = selectAutoArchiveCandidates({
+        now: Date.now(),
+        children: children.map((child) => ({ piSessionId: child.piSessionId, file: child.file ?? "", cwd: child.cwd })),
+        completions: completionTimes(entries),
+        kept: keptChildren(entries),
+        catalogs,
+        minIdleMs: config.wake.archiveMinIdleMs,
+        gaveUp: autoArchiveGaveUp,
+      });
+      if (candidates.length === 0) return;
+      const result = await performAutoArchive({ ...deps, attempts: autoArchiveAttempts }, { candidates });
+      for (const item of result.items) if (item.giveUp) autoArchiveGaveUp.add(item.piSessionId);
+      const archived = result.items.filter((item) => item.outcome === "archived");
+      if (archived.length === 0 || !getLiveContext(ctx, generation)) return;
+      const lines = archived.map((item) => `- ${item.name ? `"${item.name}" ` : ""}${item.piSessionId}`);
+      const text = `Archived ${archived.length} finished subsession${archived.length === 1 ? "" : "s"} automatically (this session has /archive-trust). Restore them from the archive in PI WEB if needed; mark a subsession with intercom keep to stop this.\n${lines.join("\n")}`;
+      pi.sendMessage({ customType: "intercom_auto_archive", content: text, display: true, details: { archived: archived.map((item) => item.piSessionId) } }, agentRunning ? { deliverAs: "nextTurn" } : { triggerTurn: false });
+      notifyIfLive(live, `Archived ${archived.length} finished subsession${archived.length === 1 ? "" : "s"} (see /archive-trust).`, "info", generation);
+    } catch {
+      // The next round retries; a failed round must never disturb the session.
+    } finally {
+      autoArchiveBusy = false;
+    }
+  }
+  function startAutoArchiveTimer(ctx: ExtensionContext, generation: number): void {
+    clearAutoArchiveTimer();
+    if (config.wake.autoArchive !== "trusted-children") return;
+    // Once a minute; PI_INTERCOM_AUTO_ARCHIVE_INTERVAL_MS exists for tests.
+    const configured = Number(process.env.PI_INTERCOM_AUTO_ARCHIVE_INTERVAL_MS);
+    autoArchiveTimer = setInterval(() => { void autoArchiveTick(ctx, generation); }, Number.isSafeInteger(configured) && configured >= 50 ? configured : 60_000);
+    autoArchiveTimer.unref?.();
+  }
   /** `send` with wakeIfDisconnected: deliver normally when the target is connected, otherwise hold the message and reopen the session. */
   async function sendWithWake(
     connectedClient: IntercomClient,
@@ -2040,11 +2277,12 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     if (!result.ok) {
       return fail(result.text, { wake: { outcome: result.outcome, code: result.code }, messageId: result.messageId });
     }
-    pi.appendEntry("intercom_sent", {
+    appendSent({
       to: result.target?.name ?? request.to,
       message: { text: request.message, attachments: request.attachments },
       messageId: result.messageId,
       timestamp: Date.now(),
+      recipient: { id: result.target?.piSessionId ?? request.to, ...(result.target?.piSessionId ? { piSessionId: result.target.piSessionId } : {}), ...(result.target?.cwd ? { cwd: result.target.cwd } : {}), ...(result.target?.name ? { name: result.target.name } : {}) },
       wake: { outcome: result.outcome, piSessionId: result.target?.piSessionId },
     });
     const held = result.outcome === "uncertain" || result.outcome === "accepted_unconfirmed";
@@ -2070,11 +2308,12 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     if (!result.ok) {
       return { content: [{ type: "text", text: result.text }], details: { error: true, spawn: { outcome: result.outcome, code: result.code, piSessionId: result.target?.piSessionId }, messageId: result.messageId } };
     }
-    pi.appendEntry("intercom_sent", {
+    appendSent({
       to: result.target?.piSessionId ?? targetCwd,
       message: { text: request.message },
       messageId: result.messageId,
       timestamp: Date.now(),
+      recipient: { id: result.target?.piSessionId ?? targetCwd, ...(result.target?.piSessionId ? { piSessionId: result.target.piSessionId } : {}), cwd: targetCwd },
       wake: { outcome: result.outcome, piSessionId: result.target?.piSessionId, spawn: true },
     });
     const held = result.outcome === "uncertain" || result.outcome === "accepted_unconfirmed";
@@ -2184,6 +2423,82 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       notifyCommand(ctx, `/wake-trust failed: ${getErrorMessage(error)}`, "error");
     }
   }
+  /** /archive-trust on | off | status | list | revoke <Pi session id>. A separate permission from /wake-trust; changes always need the user's confirmation. */
+  async function runArchiveTrustCommand(args: string, ctx: ExtensionContext): Promise<void> {
+    const [sub = "", arg = ""] = args.trim().split(/\s+/);
+    const store = new ArchiveTrustStore(archiveTrustPath());
+    const self = { piSessionId: ctx.sessionManager.getSessionId(), name: pi.getSessionName()?.trim() || undefined, cwd: ctx.cwd };
+    const days = config.wake.archiveTrustDays;
+    const label = (e: { piSessionId: string; name?: string; cwd: string }) => `${e.name ? `"${e.name}" ` : ""}${e.piSessionId} in ${e.cwd}`;
+    const globalSwitch = config.wake.autoArchive === "trusted-children";
+    const record = (outcome: "archive_trust_granted" | "archive_trust_revoked", subject: { piSessionId: string; name?: string; cwd: string }, detail: string) => {
+      new WakeAudit(wakeAuditPath(), config.wake.auditMaxEntries, config.wake.auditRetentionDays * 24 * 60 * 60 * 1000).append({
+        ts: Date.now(), outcome, code: outcome, messageId: `archive-trust-${randomUUID()}`,
+        target: { piSessionId: subject.piSessionId, cwd: subject.cwd, ...(subject.name ? { name: subject.name } : {}) },
+        sender: { piSessionId: self.piSessionId, cwd: self.cwd }, textLength: 0, textSha256: sha256(""), detail,
+      });
+    };
+    const confirm = async (title: string, body: string): Promise<boolean> => {
+      if (!ctx.hasUI) {
+        notifyCommand(ctx, "/archive-trust changes need the user's confirmation in a dialog, and this session has no UI.", "error");
+        return false;
+      }
+      try { return await ctx.ui.confirm(title, body); } catch { return false; }
+    };
+    try {
+      if (sub === "status" || sub === "") {
+        const mine = store.find(self.piSessionId);
+        notifyCommand(ctx, [
+          "**Automatic archiving of finished subsessions**",
+          `Global switch wake.autoArchive: ${config.wake.autoArchive}${globalSwitch ? "" : " (off: nothing is archived automatically, whatever the permissions)"}`,
+          `This session may archive its finished subsessions by itself: ${mine ? `yes, until ${new Date(mine.expiresAt).toISOString()}` : "no (/archive-trust on to allow it)"}`,
+          "This permission is separate from /wake-trust.",
+        ].join("\n"), "info");
+        return;
+      }
+      if (sub === "list") {
+        const grants = store.list();
+        notifyCommand(ctx, grants.length
+          ? ["**Sessions allowed to archive their finished subsessions by themselves**", ...grants.map((g) => `- ${label(g)} until ${new Date(g.expiresAt).toISOString()}`)].join("\n")
+          : "No session is allowed to archive its subsessions by itself.", "info");
+        return;
+      }
+      if (sub === "on") {
+        const head = `Session ${clip(label(self), 220)} will archive its OWN finished subsessions (spawn_subsession) by itself, WITHOUT asking you each time: direct children only, after their result was delivered and they were idle for ${Math.round(config.wake.archiveMinIdleMs / 60_000)} minutes, at most ${config.wake.autoArchiveMax} per hour, in the allowed directories. Nothing is deleted: restore from the archive in PI WEB. Mark one with intercom keep to exclude it. Separate from /wake-trust. Lasts ${days} days or until /archive-trust off.${globalSwitch ? "" : ' It has no effect until wake.autoArchive is "trusted-children" in the intercom config (now off).'}`;
+        if (!await confirm("Let this session archive its finished subsessions by itself?", clip(head, 900))) {
+          notifyCommand(ctx, "Not changed.", "info");
+          return;
+        }
+        const entry = store.grant(self, days);
+        record("archive_trust_granted", self, `until ${new Date(entry.expiresAt).toISOString()}`);
+        notifyCommand(ctx, `This session may now archive its finished subsessions by itself until ${new Date(entry.expiresAt).toISOString()}.${globalSwitch ? "" : ' Note: wake.autoArchive is off in the intercom config, so nothing happens until it is set to "trusted-children".'}`, "info");
+        return;
+      }
+      if (sub === "off" || sub === "revoke") {
+        const id = sub === "off" ? self.piSessionId : arg;
+        if (!id) {
+          notifyCommand(ctx, "Usage: /archive-trust revoke <full Pi session id> (see /archive-trust list).", "warning");
+          return;
+        }
+        const current = store.list().find((g) => g.piSessionId === id);
+        if (!current) {
+          notifyCommand(ctx, sub === "off" ? "This session has no permission to remove." : `No permission for ${id}.`, "info");
+          return;
+        }
+        if (!await confirm("Stop automatic archiving of subsessions?", clip(`Session ${label(current)} will no longer archive its finished subsessions by itself; archiving needs your confirmation again.`, 900))) {
+          notifyCommand(ctx, "Not changed.", "info");
+          return;
+        }
+        store.revoke(id);
+        record("archive_trust_revoked", current, sub);
+        notifyCommand(ctx, `Removed: ${label(current)} no longer archives subsessions by itself.`, "info");
+        return;
+      }
+      notifyCommand(ctx, "Usage: /archive-trust on | off | status | list | revoke <Pi session id>", "info");
+    } catch (error) {
+      notifyCommand(ctx, `/archive-trust failed: ${getErrorMessage(error)}`, "error");
+    }
+  }
   function runWakeStatusCommand(ctx: ExtensionContext): void {
     const wake = config.wake;
     const lines = [
@@ -2192,7 +2507,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       `Provider: ${wake.provider}${createWakeProvider(wake.provider, {}) ? "" : " (not available)"}`,
       `Confirmation: ${wake.confirm}`,
       `Creating sessions in other projects (spawn): asks ${wake.spawnConfirm === "always" ? "every time, trusted senders included" : wake.spawnConfirm === "trusted" ? "unless the sender has /wake-trust" : "never"}; at most ${wake.spawnMax} per ${Math.round(wake.spawnWindowMs / 60_000)} min`,
-      `Archiving a session created by spawn: always asks the user (not configurable); at most ${wake.archiveMax} per ${Math.round(wake.spawnWindowMs / 60_000)} min`,
+      `Archiving a session created by spawn or a tracked subsession: always asks the user (not configurable); at most ${wake.archiveMax} per ${Math.round(wake.spawnWindowMs / 60_000)} min`,
+      `Automatic archiving of finished subsessions: global switch ${wake.autoArchive}; this session's own permission comes only from /archive-trust (${new ArchiveTrustStore(archiveTrustPath()).find(ctx.sessionManager.getSessionId()) ? "granted" : "not granted"})`,
       ...(() => {
         try {
           const grants = new WakeTrustStore(wakeTrustPath()).list();
@@ -2278,6 +2594,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     shuttingDown = false;
     disposed = false;
     runtimeStarted = true;
+    runtimeStartedAt = Date.now();
     runtimeGeneration += 1;
     outboxRequestIds.clear();
     reconnectAttempt = 0;
@@ -2428,6 +2745,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       return;
     }
     startSessionRuntime(ctx);
+    startAutoArchiveTimer(ctx, runtimeGeneration);
+    void detectAskModel(ctx, runtimeGeneration).then(() => verifyOpenAsk(ctx, runtimeGeneration));
   });
   
   pi.on("session_shutdown", async () => {
@@ -2442,6 +2761,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     clearStartupConnectTimer();
     clearReconnectTimer();
     clearNamePollTimer();
+    clearAutoArchiveTimer();
     restoreIntercomSessionId();
     rejectReplyWaiter(new Error("Session shutting down"));
     replyTracker.reset();
@@ -2697,11 +3017,12 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
                 details: deliveryDetails(result),
               };
             }
-            pi.appendEntry("intercom_sent", {
+            appendSent({
               to: metadata.orchestratorTarget,
               message: { text: message, reason },
               messageId: result.id,
               timestamp: Date.now(),
+              delivery: result.delivery,
               subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
             });
             return {
@@ -2844,7 +3165,9 @@ Usage:
   intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
   intercom({ action: "send", to: "<full session id or unique name>", cwd: "/path", wakeIfDisconnected: true, message: "..." }) → If that persisted session is not connected, hold the message and reopen the session (opt-in, needs user confirmation)
   intercom({ action: "spawn", cwd: "/path/of/another/project", message: "task for the new session" }) → Create a new session in that project and send it the task (opt-in, asks the user)
-  intercom({ action: "archive", to: "<full Pi session id>", cwd: "/path" }) → Archive a session you created with spawn (the user is always asked)
+  intercom({ action: "archive", to: "<full Pi session id>", cwd: "/path" }) → Archive a session you created with spawn, or one of your tracked subsessions (the user is always asked)
+  intercom({ action: "archive", ids: ["<id>", "<id>"] }) → Archive up to 10 of them with one confirmation that lists them
+  intercom({ action: "keep", to: "<id>" }) / unkeep → Mark a tracked subsession so it is never archived automatically
   intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
   intercom({ action: "handover", to: "name-or-id", message: "next task" }) → Summarize this session and hand it over; the receiver acts on it
   intercom({ action: "handover", cwd: "/path", openProjectPaneIfMissing: true }) → Hand over to the session in that project, opening a Herdr pane when needed
@@ -2856,8 +3179,8 @@ Usage:
       "Use to coordinate with other local pi sessions: list peers, send updates, ask for help, or check intercom connectivity.",
 
     parameters: Type.Object({
-      action: StringEnum(["list", "list-cwd", "send", "ask", "handover", "reply", "pending", "status", "cancel", "spawn", "archive"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'handover', 'reply', 'pending', 'status', 'cancel', 'spawn', or 'archive'. 'archive' archives (reversibly) a session that this session created with 'spawn': 'to' is its full Pi session id and 'cwd' its directory; the user is always asked and it is refused while the session works. 'spawn' creates a NEW session in another project ('cwd') and gives it 'message' as its task; it needs wake.enabled, the directory in wake.allowCwds, and by default asks the user every time; a session created by spawn cannot spawn. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
+      action: StringEnum(["list", "list-cwd", "send", "ask", "handover", "reply", "pending", "status", "cancel", "spawn", "archive", "keep", "unkeep"] as const, {
+        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'handover', 'reply', 'pending', 'status', 'cancel', 'spawn', or 'archive'. 'archive' archives (reversibly) sessions that this session created with 'spawn' or its own tracked subsessions (spawn_subsession): 'to' (one full Pi session id, 'cwd' optional) or 'ids' (up to 10, one confirmation lists them); the user is always asked and a working session is refused. 'keep' / 'unkeep' with 'to' mark one of your tracked subsessions so it is never archived automatically. 'spawn' creates a NEW session in another project ('cwd') and gives it 'message' as its task; it needs wake.enabled, the directory in wake.allowCwds, and by default asks the user every time; a session created by spawn cannot spawn. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
       }),
       to: Type.Optional(Type.String({
         description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
@@ -2892,6 +3215,10 @@ Usage:
       focus: Type.Optional(Type.Boolean({
         description: "For openProjectPaneIfMissing, focus the new Herdr pane. Defaults to true.",
       })),
+      ids: Type.Optional(Type.Array(Type.String(), {
+        maxItems: 10,
+        description: "For 'archive' only: up to 10 full Pi session ids to archive with one confirmation.",
+      })),
       wakeIfDisconnected: Type.Optional(Type.Boolean({
         description: "For 'send' only, with 'to' (the target's full Pi session id, or an exact name unique in 'cwd') and the target's absolute 'cwd': if the target is a persisted session that is not connected, hold the message and reopen that session so it receives it. Disabled unless wake.enabled is set; asks the user first; never for a connected target, an ask, a reply, or the current session.",
       })),
@@ -2910,7 +3237,7 @@ Usage:
 
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
-      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, wakeIfDisconnected } = params;
+      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, wakeIfDisconnected, ids } = params;
       if (wakeIfDisconnected && action !== "send") {
         return {
           content: [{ type: "text", text: "wakeIfDisconnected is only supported by the 'send' action." }],
@@ -3065,24 +3392,48 @@ Usage:
         }
 
         case "archive": {
-          if (!to || !cwd) {
-            return {
-              content: [{ type: "text", text: "archive needs 'to' (the full Pi session id of a session you created with spawn) and 'cwd' (its directory)." }],
-              details: { error: true },
-            };
-          }
           if (message || replyTo || supersedes || retryOf || openProjectPaneIfMissing || attachments?.length) {
+            return { content: [{ type: "text", text: "archive takes only 'to' (and 'cwd') or 'ids'." }], details: { error: true } };
+          }
+          const archiveDeps = buildArchiveDeps(ctx);
+          if (ids?.length) {
+            if (to || cwd) return { content: [{ type: "text", text: "Use either 'ids' or 'to', not both." }], details: { error: true } };
+            const many = await performArchiveMany(archiveDeps, { ids, signal: _signal });
             return {
-              content: [{ type: "text", text: "archive takes only 'to' and 'cwd'." }],
-              details: { error: true },
+              content: [{ type: "text", text: many.text }],
+              details: many.ok ? { archived: true, results: many.results.map((r) => ({ piSessionId: r.piSessionId, ok: r.ok, code: r.code })) } : { error: true, archive: { code: many.code }, results: many.results.map((r) => ({ piSessionId: r.piSessionId, ok: r.ok, code: r.code })) },
             };
           }
-          const { client: _unused, ...archiveDeps } = buildWakeDeps(connectedClient, ctx);
-          const archived = await performArchive(archiveDeps, { piSessionId: to, cwd: resolvePath(ctx.cwd, cwd), signal: _signal });
+          if (!to) {
+            return { content: [{ type: "text", text: `archive needs 'to' (the full Pi session id) or 'ids' (up to ${MAX_ARCHIVE_BATCH}).` }], details: { error: true } };
+          }
+          // The directory is optional: it is known for sessions created with spawn (audit) and for tracked subsessions.
+          let targetCwd = cwd ? resolvePath(ctx.cwd, cwd) : archiveDeps.children?.find((child) => child.piSessionId === to)?.cwd;
+          if (!targetCwd) {
+            try {
+              targetCwd = archiveDeps.audit.read().find((e) => e.kind === "spawn" && e.target.piSessionId === to && e.sender.piSessionId === archiveDeps.self.piSessionId && e.target.cwd)?.target.cwd;
+            } catch {
+              targetCwd = undefined;
+            }
+          }
+          if (!targetCwd) {
+            return { content: [{ type: "text", text: "archive could not tell which directory that session is in: it is neither a session this session created with spawn nor one of its tracked subsessions." }], details: { error: true } };
+          }
+          const archived = await performArchive(archiveDeps, { piSessionId: to, cwd: targetCwd, signal: _signal });
           return {
             content: [{ type: "text", text: archived.text }],
             details: archived.ok ? { archived: true, piSessionId: archived.target.piSessionId } : { error: true, archive: { outcome: archived.outcome, code: archived.code } },
           };
+        }
+
+        case "keep":
+        case "unkeep": {
+          if (!to) return { content: [{ type: "text", text: `${action} needs 'to' (the full Pi session id of one of your tracked subsessions).` }], details: { error: true } };
+          const mine = trackedChildren(ctx.sessionManager.getEntries(), ctx.sessionManager.getSessionId()).find((child) => child.piSessionId === to);
+          if (!mine) return { content: [{ type: "text", text: `${to} is not one of this session's tracked subsessions (spawn_subsession).` }], details: { error: true } };
+          pi.appendEntry(KEEP_ENTRY, { id: to, keep: action === "keep", timestamp: Date.now() });
+          if (action === "keep") autoArchiveGaveUp.delete(to);
+          return { content: [{ type: "text", text: action === "keep" ? `Marked ${to} keep: it will not be archived automatically.` : `Removed the keep mark from ${to}: it may be archived automatically when it is finished (only if the user allowed that with /archive-trust).` }], details: { kept: action === "keep", piSessionId: to } };
         }
 
         case "handover": {
@@ -3186,12 +3537,15 @@ Usage:
                 details: { error: true, ...deliveryDetails(sendResult) },
               };
             }
-            pi.appendEntry("intercom_sent", {
+            appendSent({
               to: askTarget,
               message: { text: message, attachments, replyTo, supersedes, retryOf },
               messageId: sendResult.id,
               timestamp: Date.now(),
-            });
+              expectsReply: true,
+              delivery: sendResult.delivery,
+              recipient: (await lookupRecipient(connectedClient, sendTo)) ?? { id: sendTo },
+            }, sendTo);
             const replyMessage = await sent.reply;
             const replyText = replyMessage.content.text;
             const replyAttachments = replyMessage.content.attachments?.length
@@ -3247,12 +3601,14 @@ Usage:
               };
             }
             dismissIncomingAsk(target.message.id);
-            pi.appendEntry("intercom_sent", {
+            appendSent({
               to: target.from.name || target.from.id,
               message: { text: message, attachments, replyTo: target.message.id },
               messageId: result.id,
               timestamp: Date.now(),
-            });
+              delivery: result.delivery,
+              recipient: recipientInfo(target.from),
+            }, target.from.id);
             return {
               content: [{ type: "text", text: result.delivery === "queued" ? queuedText(target.from.name || target.from.id, "reply") : `Reply sent to ${target.from.name || target.from.id}` }],
               details: { ...deliveryDetails(result), replyTo: target.message.id },
@@ -3692,6 +4048,21 @@ Usage:
     handler: async (_args, ctx) => openIntercomOverlay(ctx),
   });
 
+  pi.registerCommand("intercom-debug", {
+    description: "Show or hide incoming intercom messages in the chat (usage: /intercom-debug on|off|status|reset; this session only)",
+    handler: async (args, ctx) => {
+      const arg = (args ?? "").trim().toLowerCase();
+      if (arg === "on" || arg === "off") showInChatOverride = arg === "on";
+      else if (arg === "reset") showInChatOverride = undefined;
+      else if (arg !== "" && arg !== "status") {
+        ctx.ui?.notify("Usage: /intercom-debug on|off|status|reset", "warning");
+        return;
+      }
+      const source = showInChatOverride !== undefined ? "set with /intercom-debug" : resolveShowInChat(false, undefined) ? "PI_INTERCOM_DEBUG" : config.showInChat ? "showInChat in config" : "default";
+      ctx.ui?.notify(`Intercom messages are ${showInChat() ? "shown in" : "hidden from"} the chat (${source}). Applies to messages received from now on; they reach the model either way.`, "info");
+    },
+  });
+
   pi.registerCommand("intercom-id", {
     description: "Insert a stable pi-intercom handoff snippet for this session into the editor",
     handler: async (_args, ctx) => insertIntercomId(ctx),
@@ -3717,6 +4088,11 @@ Usage:
   pi.registerCommand("wake-trust", {
     description: "Allow this session to wake other sessions without a confirmation dialog, or remove that permission (usage: /wake-trust on | off | list | revoke <Pi session id>)",
     handler: async (args, ctx) => runWakeTrustCommand(args, ctx),
+  });
+
+  pi.registerCommand("archive-trust", {
+    description: "Allow this session to archive its own finished subsessions by itself, or remove that permission (separate from /wake-trust; usage: /archive-trust on | off | status | list | revoke <Pi session id>)",
+    handler: async (args, ctx) => runArchiveTrustCommand(args, ctx),
   });
 
   pi.registerCommand("intercom-wake-status", {

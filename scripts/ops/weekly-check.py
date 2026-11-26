@@ -38,7 +38,7 @@ def get_json(url):
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode())
 
-result = {"wake": e2e("wake", "checks passed"), "busy": e2e("busy", "all expectations met")}
+result = {"wake": e2e("wake", "checks passed"), "busy": e2e("busy", "all expectations met"), "askshield": e2e("askshield", "all expectations met")}
 if result["wake"]["ok"]:
     result["wake"]["ok"] = result["wake"]["summary"].split("/")[0] == result["wake"]["summary"].split("/")[1].split(" ")[0]
 
@@ -61,14 +61,40 @@ try:
 except Exception:  # noqa: BLE001
     result["piWeb"] = None
 
-ok = result["wake"]["ok"] and result["busy"]["ok"]
+# PI WEB 1.202610.8 and newer do not bundle the Pi SDK: the daemon is started with PI_WEB_PI_PACKAGE_DIR pointing into
+# ~/.pi/agent/install/releases/<version>. Pi prunes old releases when it updates, so that path can go missing (new sessions would
+# then fail to load) until the daemon is restarted.
+def pi_sdk():
+    try:
+        pid = json.load(open(os.path.expanduser("~/.pi-web/sessiond-owner.json")))["pid"]
+        env = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+    except Exception:  # noqa: BLE001
+        return None
+    value = next((e.split(b"=", 1)[1].decode() for e in env if e.startswith(b"PI_WEB_PI_PACKAGE_DIR=")), None)
+    if not value:
+        return None
+    try:
+        current = open(os.path.expanduser("~/.pi/agent/install/current-version")).read().strip()
+    except Exception:  # noqa: BLE001
+        current = None
+    exists = os.path.isfile(os.path.join(value, "package.json"))
+    return {"dir": value, "exists": exists, "currentVersion": current, "behindCurrent": bool(current) and f"/releases/{current}/" not in value}
+sdk = pi_sdk()
+if sdk is not None:
+    result["piSdk"] = sdk
+    if not sdk["exists"]:
+        notes.append("the Pi SDK path of the PI WEB daemon no longer exists: restart the daemon")
+    elif sdk["behindCurrent"]:
+        notes.append(f"Pi was updated to {sdk['currentVersion']}; the daemon still uses an older SDK until it is restarted")
+
+ok = result["wake"]["ok"] and result["busy"]["ok"] and result["askshield"]["ok"]
 changed = result["upstream"].get("changed") or result["npm"].get("changed")
 result["ok"] = ok
 result["attention"] = (not ok) or bool(changed) or bool(notes)
 lines = []
 if not ok:
     lines.append("End-to-end wake checks FAILED with PI WEB " + str(result["piWeb"]) + ". Wakes may be refused (fail-closed, no harm) until this is fixed.")
-    for name in ("wake", "busy"):
+    for name in ("wake", "busy", "askshield"):
         if not result[name]["ok"]:
             lines.append(f"- {name}: {result[name]['summary']} " + "; ".join(result[name]["fails"][:5]))
 if result["upstream"].get("changed"):

@@ -11,6 +11,8 @@ export type WakeOutcome =
   | "uncertain"           // the host's answer is unknown; the message stays held
   | "failed"              // the host refused; the held message was withdrawn
   | "archived"            // an archive action: the host archived a session that spawn had created
+  | "archive_trust_granted" // the user allowed a parent session to archive its finished subsessions by itself (/archive-trust on)
+  | "archive_trust_revoked" // the user removed that permission
   | "refused"             // the user declined
   | "blocked"             // a policy or validation check stopped it before anything was held
   | "trust_granted"       // the user allowed a session to wake others without confirmation (/wake-trust on)
@@ -19,7 +21,7 @@ export type WakeOutcome =
 export interface WakeAuditEntry {
   ts: number;
   /** `spawn` for a session created by the spawn action; absent or `wake` for a wake of an existing session. */
-  kind?: "wake" | "spawn" | "archive";
+  kind?: "wake" | "spawn" | "archive" | "archive_auto";
   outcome: WakeOutcome;
   code: string;
   messageId: string;
@@ -34,7 +36,7 @@ export interface WakeAuditEntry {
   daemon?: string;
   durationMs?: number;
   /** How the wake was approved: the user in a dialog, a /wake-trust grant, or wake.confirm = "never". */
-  confirmedBy?: "user" | "trust" | "config";
+  confirmedBy?: "user" | "trust" | "config" | "archive-trust";
   /** Short, content-free diagnostic. Never the message text. */
   detail?: string;
 }

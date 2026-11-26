@@ -196,6 +196,8 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
   ui?: unknown;
   sessionId?: string | (() => string);
   activeTools?: string[];
+  /** Entries of the session itself, as ctx.sessionManager.getEntries() returns them. */
+  sessionEntries?: unknown[];
 } = {}) {
   const events = new EventEmitter();
   const lifecycleHandlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
@@ -243,7 +245,7 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
     cwd: repoDir,
     mode: options.mode ?? (options.hasUI ? "tui" : "print"),
     model: { id: "child-model" },
-    sessionManager: { getSessionId: () => typeof options.sessionId === "function" ? options.sessionId() : options.sessionId ?? "session-child-test" },
+    sessionManager: { getSessionId: () => typeof options.sessionId === "function" ? options.sessionId() : options.sessionId ?? "session-child-test", getEntries: () => options.sessionEntries ?? [] },
     isIdle: options.isIdle ?? (() => true),
     hasUI: options.hasUI ?? false,
     abort: options.abort ?? (() => undefined),
@@ -2300,9 +2302,10 @@ async function withWake<T>(overrides: Record<string, unknown>, fn: (ctl: {
   setProvider: (wake: (messageId: string, open: () => Promise<void>) => Promise<void>, catalog?: Array<Record<string, unknown>>) => void;
   openTarget: () => Promise<void>;
   runWakeCommand: (messageId: string) => Promise<void>;
+  archiveCalls: Array<{ piSessionId: string; cwd: string }>;
   tool: (params: Record<string, unknown>) => Promise<CapturedToolResult>;
   audit: () => Array<Record<string, unknown>>;
-}) => Promise<T>, options: { confirm?: boolean | ((body: string) => boolean); senderHasUi?: boolean; withConfig?: boolean } = {}): Promise<T> {
+}) => Promise<T>, options: { confirm?: boolean | ((body: string) => boolean); senderHasUi?: boolean; withConfig?: boolean; senderEntries?: unknown[]; beforeStart?: () => void | Promise<void> } = {}): Promise<T> {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { registerWakeProvider } = await import("./wake/provider.ts");
   const { wakeAuditPath } = await import("./wake/audit.ts");
@@ -2310,8 +2313,11 @@ async function withWake<T>(overrides: Record<string, unknown>, fn: (ctl: {
   const { planner, cleanup } = await setupClients();
   rmSync(wakeAuditPath(), { force: true });
   rmSync(wakeTrustPath(), { force: true });
+  rmSync((await import("./wake/archive-trust.ts")).archiveTrustPath(), { force: true });
+  await options.beforeStart?.();
   const answer = (body: string) => (typeof options.confirm === "function" ? options.confirm(body) : options.confirm !== false);
   const wakeCalls: string[] = [];
+  const archiveCalls: Array<{ piSessionId: string; cwd: string }> = [];
   const confirmations: string[] = [];
   const notices: string[] = [];
   let catalog: Array<Record<string, unknown>> = [{ piSessionId: WAKE_TARGET_PI_ID, cwd: repoDir, name: "wake-target", archived: false }];
@@ -2323,6 +2329,7 @@ async function withWake<T>(overrides: Record<string, unknown>, fn: (ctl: {
     const sender = createExtensionHarness("wake-sender", {
       hasUI: options.senderHasUi !== false,
       sessionId: "wake-sender-pi-id",
+      ...(options.senderEntries ? { sessionEntries: options.senderEntries } : {}),
       ui: { confirm: async (_title: string, body: string) => { confirmations.push(body); return answer(body); }, notify: (message: string) => { notices.push(message); } },
     });
     const target = createExtensionHarness("wake-target", { hasUI: true, isIdle: () => true, sessionId: WAKE_TARGET_PI_ID, ui: { confirm: async (_title: string, body: string) => { confirmations.push(body); return answer(body); }, notify: (message: string) => { notices.push(message); } } });
@@ -2330,6 +2337,8 @@ async function withWake<T>(overrides: Record<string, unknown>, fn: (ctl: {
       id: "fake-wake",
       describe: () => "fake 1",
       list: async (cwd) => catalog.filter((entry) => entry.cwd === cwd) as never,
+      // What the daemon does: the session is then listed as archived.
+      archive: async (target: { piSessionId: string; cwd: string }) => { archiveCalls.push(target); const entry = catalog.find((item) => item.piSessionId === target.piSessionId); if (entry) entry.archived = true; },
       wake: async (_target, messageId) => {
         wakeCalls.push(messageId);
         // What the session daemon does: open the saved session, then run the prompt it was given.
@@ -2343,7 +2352,7 @@ async function withWake<T>(overrides: Record<string, unknown>, fn: (ctl: {
       await waitForSessionByName(planner, "wake-sender");
       const tool = sender.tools.find((candidate) => candidate.name === "intercom")!;
       return await fn({
-        planner, sender, target, wakeCalls, confirmations, notices,
+        planner, sender, target, wakeCalls, archiveCalls, confirmations, notices,
         setProvider: (next, nextCatalog) => { wake = next; if (nextCatalog) catalog = nextCatalog; },
         openTarget: async () => { await target.emitLifecycle("session_start"); },
         runWakeCommand: async (messageId) => { await target.commands.get("intercom-wake")!(messageId, target.ctx); },
@@ -3376,6 +3385,39 @@ test("turn_start re-registers when Pi replaces the session context", { concurren
     assert.equal(replaced.name, "fork-after");
     await waitForNoSessionId(planner, "session-fork-before");
   } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("incoming intercom messages are hidden from the chat by default and shown with /intercom-debug", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("hidden-worker", { hasUI: true });
+  const saved = process.env.PI_INTERCOM_DEBUG;
+  delete process.env.PI_INTERCOM_DEBUG;
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const target = await waitForSessionByName(planner, "hidden-worker");
+
+    await planner.send(target.id, { messageId: "hid-1", text: "service traffic one" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(harness.sentMessages.length, 1);
+    assert.equal(harness.sentMessages[0]?.message.display, false, "hidden from the chat by default");
+    assert.match(harness.sentMessages[0]?.message.content ?? "", /service traffic one/, "the model still gets the message");
+
+    await harness.commands.get("intercom-debug")!("on", harness.ctx);
+    await planner.send(target.id, { messageId: "hid-2", text: "service traffic two" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(harness.sentMessages[1]?.message.display, true, "shown after /intercom-debug on");
+
+    await harness.commands.get("intercom-debug")!("reset", harness.ctx);
+    await planner.send(target.id, { messageId: "hid-3", text: "service traffic three" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(harness.sentMessages[2]?.message.display, false, "back to the default after reset");
+  } finally {
+    if (saved === undefined) delete process.env.PI_INTERCOM_DEBUG; else process.env.PI_INTERCOM_DEBUG = saved;
     await harness.emitLifecycle("session_shutdown");
     await cleanup();
   }
@@ -6411,5 +6453,506 @@ test("registered inline renderer follows real CustomMessageComponent rebuild and
       if (descriptor) Object.defineProperty(globalThis, key, descriptor);
       else Reflect.deleteProperty(globalThis, key);
     });
+  }
+});
+
+
+// ---- LOCAL-WI-005: /archive-trust, keep/unkeep, archive of tracked subsessions, automatic archiving
+const PARENT_PI_ID = "wake-sender-pi-id";
+const childLink = (childId: string, file: string) => ({ type: "custom", customType: "pi-web.subsession.link", data: { version: 1, spawnedBySessionId: PARENT_PI_ID, spawnedSessionId: childId, spawnedSessionFile: file } });
+
+test("/archive-trust is a separate permission: it asks, grants only itself, and does not make the session a wake-trusted sender", { concurrency: false }, async () => {
+  const { ArchiveTrustStore, archiveTrustPath } = await import("./wake/archive-trust.ts");
+  const { WakeTrustStore, wakeTrustPath } = await import("./wake/trust.ts");
+  await withWake({}, async (ctl) => {
+    await ctl.sender.commands.get("archive-trust")!("on", ctl.sender.ctx);
+    assert.equal(ctl.confirmations.length, 1);
+    assert.match(ctl.confirmations[0]!, /archive its OWN finished subsessions/);
+    assert.match(ctl.confirmations[0]!, /Separate from \/wake-trust/);
+    assert.ok(ctl.confirmations[0]!.length <= 900);
+    assert.equal(new ArchiveTrustStore(archiveTrustPath()).find(PARENT_PI_ID) !== undefined, true);
+    assert.equal(new WakeTrustStore(wakeTrustPath()).find(PARENT_PI_ID), undefined, "wake trust is untouched");
+    assert.ok(ctl.audit().some((entry) => entry.outcome === "archive_trust_granted" && (entry.target as { piSessionId: string }).piSessionId === PARENT_PI_ID));
+    // Without it being a wake grant, a wake still asks.
+    ctl.setProvider(async () => undefined);
+    await ctl.tool(wakeParams({ message: "Still asks" }));
+    assert.equal(ctl.confirmations.length, 2, "an /archive-trust grant does not skip the wake dialog");
+    await ctl.sender.commands.get("archive-trust")!("off", ctl.sender.ctx);
+    assert.equal(new ArchiveTrustStore(archiveTrustPath()).find(PARENT_PI_ID), undefined);
+    assert.ok(ctl.audit().some((entry) => entry.outcome === "archive_trust_revoked"));
+  });
+});
+
+test("/wake-trust does not grant automatic archiving, and /archive-trust grants nothing when declined or without a UI", { concurrency: false }, async () => {
+  const { ArchiveTrustStore, archiveTrustPath } = await import("./wake/archive-trust.ts");
+  await withWake({}, async (ctl) => {
+    await ctl.sender.commands.get("wake-trust")!("on", ctl.sender.ctx);
+    assert.equal(new ArchiveTrustStore(archiveTrustPath()).find(PARENT_PI_ID), undefined);
+  });
+  await withWake({}, async (ctl) => {
+    await ctl.sender.commands.get("archive-trust")!("on", ctl.sender.ctx);
+    assert.equal(new ArchiveTrustStore(archiveTrustPath()).find(PARENT_PI_ID), undefined, "declined");
+  }, { confirm: false });
+  await withWake({}, async (ctl) => {
+    await ctl.sender.commands.get("archive-trust")!("on", ctl.sender.ctx);
+    assert.equal(new ArchiveTrustStore(archiveTrustPath()).find(PARENT_PI_ID), undefined, "no UI");
+  }, { senderHasUi: false });
+});
+
+test("/archive-trust status shows the global switch and this session's permission; the wake status mentions both keys", { concurrency: false }, async () => {
+  await withWake({}, async (ctl) => {
+    await ctl.sender.commands.get("archive-trust")!("status", ctl.sender.ctx);
+    const status = ctl.notices.find((notice) => notice.startsWith("**Automatic archiving"))!;
+    assert.match(status, /wake.autoArchive: off/);
+    assert.match(status, /nothing is archived automatically/);
+    assert.match(status, /no \(\/archive-trust on/);
+    await ctl.sender.commands.get("intercom-wake-status")!("", ctl.sender.ctx);
+    assert.ok(ctl.notices.some((notice) => /global switch off; this session's own permission comes only from \/archive-trust \(not granted\)/.test(notice)));
+  });
+});
+
+test("keep and unkeep apply to this session's own tracked subsessions only", { concurrency: false }, async () => {
+  await withWake({}, async (ctl) => {
+    const stranger = await ctl.tool({ action: "keep", to: "0198ffff-0000-7000-8000-000000000000" });
+    assert.equal(stranger.details?.error, true);
+    assert.equal(ctl.sender.entries.some((entry) => entry.type === "intercom_keep"), false);
+    const missing = await ctl.tool({ action: "keep" });
+    assert.equal(missing.details?.error, true);
+  }, { senderEntries: [childLink("0198cccc-0000-7000-8000-000000000001", "/x/2026_0198cccc-0000-7000-8000-000000000001.jsonl")] });
+  await withWake({}, async (ctl) => {
+    const kept = await ctl.tool({ action: "keep", to: "0198cccc-0000-7000-8000-000000000001" });
+    assert.notEqual(kept.details?.error, true, kept.content[0]?.text);
+    assert.deepEqual(ctl.sender.entries.filter((entry) => entry.type === "intercom_keep").map((entry) => (entry.data as { id: string; keep: boolean }).keep), [true]);
+    await ctl.tool({ action: "unkeep", to: "0198cccc-0000-7000-8000-000000000001" });
+    assert.deepEqual(ctl.sender.entries.filter((entry) => entry.type === "intercom_keep").map((entry) => (entry.data as { keep: boolean }).keep), [true, false]);
+  }, { senderEntries: [childLink("0198cccc-0000-7000-8000-000000000001", "/x/2026_0198cccc-0000-7000-8000-000000000001.jsonl")] });
+});
+
+test("archive takes either one id or a list, and refuses anything that is not this session's own", { concurrency: false }, async () => {
+  await withWake({}, async (ctl) => {
+    const both = await ctl.tool({ action: "archive", to: "0198ffff-0000-7000-8000-000000000000", cwd: repoDir, ids: ["0198ffff-0000-7000-8000-000000000001"] });
+    assert.match(both.content[0]!.text, /either 'ids' or 'to'/);
+    const none = await ctl.tool({ action: "archive" });
+    assert.match(none.content[0]!.text, /needs 'to'/);
+    const unknown = await ctl.tool({ action: "archive", to: "0198ffff-0000-7000-8000-000000000000" });
+    assert.match(unknown.content[0]!.text, /could not tell which directory/);
+    const stranger = await ctl.tool({ action: "archive", ids: ["0198ffff-0000-7000-8000-000000000000"] });
+    assert.equal(stranger.details?.error, true);
+    assert.equal(ctl.confirmations.length, 0, "nothing eligible: the user is not even asked");
+  });
+});
+
+test("a trusted parent archives its finished subsession by itself, with no dialog, a visible note, and an audit entry", { concurrency: false }, async () => {
+  const { ArchiveTrustStore, archiveTrustPath } = await import("./wake/archive-trust.ts");
+  const { getAgentDir } = await import("@earendil-works/pi-coding-agent");
+  const childId = "0198cccc-1111-7000-8000-000000000001";
+  const dir = path.join(getAgentDir(), "sessions", "--auto-archive-test--");
+  const file = path.join(dir, `2026-10-23T08-00-00-000Z_${childId}.jsonl`);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(file, `${JSON.stringify({ type: "session", id: childId, cwd: repoDir, parentSession: `/p/2026_${PARENT_PI_ID}.jsonl` })}\n`);
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString();
+  const entries = [childLink(childId, file), { type: "custom_message", customType: "subsession.completion", details: { sessionId: childId }, timestamp: hoursAgo(2) }];
+  const catalog = () => [{ piSessionId: childId, cwd: repoDir, name: "temporary analysis", archived: false, modified: hoursAgo(2), path: file }];
+  const previousInterval = process.env.PI_INTERCOM_AUTO_ARCHIVE_INTERVAL_MS;
+  process.env.PI_INTERCOM_AUTO_ARCHIVE_INTERVAL_MS = "100";
+  try {
+    // Both keys present: it is archived once and nothing asks.
+    await withWake({ autoArchive: "trusted-children", archiveMinIdleMs: 60_000 }, async (ctl) => {
+      ctl.setProvider(async () => undefined, catalog());
+      await waitForCondition(() => ctl.archiveCalls.length === 1, "the finished child is archived");
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      assert.equal(ctl.archiveCalls.length, 1, "archived once, not again on the next rounds");
+      assert.equal(ctl.confirmations.length, 0, "no dialog");
+      const note = ctl.sender.sentMessages.find((m) => m.message.customType === "intercom_auto_archive");
+      assert.ok(note, "the parent gets a visible note");
+      assert.match(String(note!.message.content), /temporary analysis/);
+      assert.match(String(note!.message.content), /restore/i);
+      assert.equal((note!.options as { triggerTurn?: boolean } | undefined)?.triggerTurn, false, "the note does not start a model turn");
+      const entry = ctl.audit().find((e) => e.kind === "archive_auto")!;
+      assert.deepEqual([entry.outcome, entry.confirmedBy, (entry.target as { piSessionId: string }).piSessionId], ["archived", "archive-trust", childId]);
+    }, { senderEntries: entries, beforeStart: () => new ArchiveTrustStore(archiveTrustPath()).grant({ piSessionId: PARENT_PI_ID, cwd: repoDir }, 1) });
+    // Marked keep: left alone.
+    await withWake({ autoArchive: "trusted-children", archiveMinIdleMs: 60_000 }, async (ctl) => {
+      ctl.setProvider(async () => undefined, catalog());
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      assert.deepEqual(ctl.archiveCalls, []);
+    }, { senderEntries: [...entries, { type: "custom", customType: "intercom_keep", data: { id: childId, keep: true } }], beforeStart: () => new ArchiveTrustStore(archiveTrustPath()).grant({ piSessionId: PARENT_PI_ID, cwd: repoDir }, 1) });
+    // No /archive-trust of its own (a /wake-trust grant does not count), or the global switch off: left alone.
+    await withWake({ autoArchive: "trusted-children", archiveMinIdleMs: 60_000 }, async (ctl) => {
+      ctl.setProvider(async () => undefined, catalog());
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      assert.deepEqual(ctl.archiveCalls, []);
+    }, { senderEntries: entries, beforeStart: async () => { const { WakeTrustStore, wakeTrustPath } = await import("./wake/trust.ts"); new WakeTrustStore(wakeTrustPath()).grant({ piSessionId: PARENT_PI_ID, cwd: repoDir }, 1); } });
+    await withWake({ autoArchive: "off", archiveMinIdleMs: 60_000 }, async (ctl) => {
+      ctl.setProvider(async () => undefined, catalog());
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      assert.deepEqual(ctl.archiveCalls, []);
+    }, { senderEntries: entries, beforeStart: () => new ArchiveTrustStore(archiveTrustPath()).grant({ piSessionId: PARENT_PI_ID, cwd: repoDir }, 1) });
+    // A child that got new work after its completion notice is not finished.
+    await withWake({ autoArchive: "trusted-children", archiveMinIdleMs: 60_000 }, async (ctl) => {
+      ctl.setProvider(async () => undefined, [{ ...catalog()[0]!, modified: new Date().toISOString() }]);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      assert.deepEqual(ctl.archiveCalls, []);
+    }, { senderEntries: entries, beforeStart: () => new ArchiveTrustStore(archiveTrustPath()).grant({ piSessionId: PARENT_PI_ID, cwd: repoDir }, 1) });
+  } finally {
+    if (previousInterval === undefined) delete process.env.PI_INTERCOM_AUTO_ARCHIVE_INTERVAL_MS;
+    else process.env.PI_INTERCOM_AUTO_ARCHIVE_INTERVAL_MS = previousInterval;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- LOCAL-WI-007: data for tracing requests and answers (schema v1, in the sender's own entries)
+const sentEntries = (harness: ReturnType<typeof createExtensionHarness>) => harness.entries.filter((entry) => entry.type === "intercom_sent").map((entry) => entry.data as Record<string, any>);
+const receiptEntries = (harness: ReturnType<typeof createExtensionHarness>) => harness.entries.filter((entry) => entry.type === "intercom_receipt").map((entry) => entry.data as Record<string, any>);
+async function waitUntil(condition: () => boolean, description: string, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(condition(), `timed out: ${description}`);
+}
+
+test("a plain message says how to answer it in the same thread (a text tag: replyTo is only for asks); an ask keeps its own reply hint; replyHint false removes both", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("hint-worker");
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const worker = await waitForSessionByName(planner, "hint-worker");
+    assert.equal((await planner.send(worker.id, { messageId: "plain-1", text: "A plain update." })).delivered, true);
+    await waitUntil(() => harness.sentMessages.length >= 1, "the plain message");
+    const plain = String(harness.sentMessages[0]!.message.content);
+    assert.match(plain, /To answer this message in the same thread, begin your answer with its tag: intercom\(\{ action: "send", to: "[^"]+", message: "\[RE:plain-1\] \.\.\." \}\)/);
+    assert.doesNotMatch(plain, /replyTo/, "replyTo is rejected by the broker for a plain message, so it is not suggested");
+    assert.doesNotMatch(plain, /action: "reply"/);
+    assert.equal(((harness.sentMessages[0]!.message.details as { replyCommand?: string }).replyCommand), undefined, "the UI hint is unchanged for plain messages");
+    assert.equal((await planner.send(worker.id, { messageId: "ask-1", text: "A question?", expectsReply: true })).delivered, true);
+    await waitUntil(() => harness.sentMessages.length >= 2, "the ask");
+    const ask = String(harness.sentMessages[1]!.message.content);
+    assert.match(ask, /To reply, use the intercom tool: intercom\(\{ action: "reply"/);
+    assert.doesNotMatch(ask, /same thread/);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+  await withIntercomConfig({ replyHint: false }, async () => {
+    const { planner: planner2, cleanup: cleanup2 } = await setupClients();
+    const harness2 = createExtensionHarness("hint-off-worker");
+    try {
+      piIntercomExtension(harness2.pi as never);
+      await harness2.emitLifecycle("session_start");
+      const worker = await waitForSessionByName(planner2, "hint-off-worker");
+      await planner2.send(worker.id, { messageId: "plain-2", text: "Another plain update." });
+      await waitUntil(() => harness2.sentMessages.length >= 1, "the plain message");
+      assert.doesNotMatch(String(harness2.sentMessages[0]!.message.content), /same thread|To reply/);
+    } finally {
+      await harness2.emitLifecycle("session_shutdown");
+      await cleanup2();
+    }
+  });
+});
+
+test("sent entries are versioned and say who got the message, how it was delivered, and whether it asked", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("trace-sender", { sessionId: "trace-sender-pi-id" });
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "trace-sender");
+    const tool = harness.tools.find((candidate) => candidate.name === "intercom")!;
+    const sent = await tool.execute("trace-send", { action: "send", to: "orchestrator", message: "Plain note" }, new AbortController().signal, undefined, harness.ctx);
+    assert.notEqual(sent.details?.error, true);
+    const entry = sentEntries(harness).find((e) => e.message?.text === "Plain note")!;
+    assert.equal(entry.v, 1);
+    assert.equal(typeof entry.messageId, "string");
+    assert.equal(entry.delivery, "socket_delivered");
+    assert.equal(entry.expectsReply, undefined, "a plain send does not ask");
+    assert.deepEqual([entry.recipient.id, entry.recipient.cwd, entry.recipient.name], [(await waitForSessionByName(planner, "orchestrator")).id, repoDir, "orchestrator"]);
+    // An ask is marked as such and still reaches the peer.
+    const orchestratorSession = await waitForSessionByName(planner, "orchestrator");
+    void orchestratorSession;
+    const received = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+    const asking = tool.execute("trace-ask", { action: "ask", to: "orchestrator", message: "Question?" }, new AbortController().signal, undefined, harness.ctx);
+    const [from, askMessage] = await received;
+    await orchestrator.send(from.id, { messageId: "trace-answer", text: "Answer", replyTo: askMessage.id });
+    await asking;
+    const askEntry = sentEntries(harness).find((e) => e.message?.text === "Question?")!;
+    assert.equal(askEntry.v, 1);
+    assert.equal(askEntry.expectsReply, true);
+    assert.equal(askEntry.recipient.name, "orchestrator");
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("receipts of what this session sent are recorded as intercom_receipt (v1), whether they come before or after the sent entry", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const sender = createExtensionHarness("receipt-sender", { sessionId: "receipt-sender-pi-id" });
+  const receiver = createExtensionHarness("receipt-receiver", { sessionId: "receipt-receiver-pi-id" });
+  try {
+    piIntercomExtension(sender.pi as never);
+    piIntercomExtension(receiver.pi as never);
+    await sender.emitLifecycle("session_start");
+    await receiver.emitLifecycle("session_start");
+    const senderSession = await waitForSessionByName(planner, "receipt-sender");
+    await waitForSessionByName(planner, "receipt-receiver");
+    const tool = sender.tools.find((candidate) => candidate.name === "intercom")!;
+    const result = await tool.execute("receipt-send", { action: "send", to: "receipt-receiver", message: "Please note this" }, new AbortController().signal, undefined, sender.ctx);
+    assert.notEqual(result.details?.error, true, String(result.content[0]?.text));
+    const messageId = sentEntries(sender).find((e) => e.message?.text === "Please note this")!.messageId as string;
+    await waitUntil(() => receiptEntries(sender).some((r) => r.messageId === messageId && r.status === "injected"), `the injected receipt`);
+    const receipts = receiptEntries(sender).filter((r) => r.messageId === messageId);
+    assert.ok(receipts.map((r) => r.status).includes("receiver_received"));
+    assert.ok(receipts.map((r) => r.status).includes("injected"));
+    for (const receipt of receipts) {
+      assert.equal(receipt.v, 1);
+      assert.equal(typeof receipt.timestamp, "number");
+      assert.equal(receipt.from.name, "receipt-receiver");
+      assert.equal(receipt.from.piSessionId, "receipt-receiver-pi-id");
+    }
+    // What this session only RECEIVES produces no receipt entry here: the receiver's receipts belong to the sender.
+    await planner.send(senderSession.id, { messageId: "not-from-us", text: "Not ours" });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(receiptEntries(sender).some((r) => r.messageId === "not-from-us"), false);
+    assert.equal(receiptEntries(receiver).length, 0, "the receiver sent nothing, so it records no receipts");
+  } finally {
+    await sender.emitLifecycle("session_shutdown");
+    await receiver.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("a plain send that answers the one recent message from that peer records a guess in its own entry, never on the wire", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("infer-worker");
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const worker = await waitForSessionByName(planner, "infer-worker");
+    const tool = harness.tools.find((candidate) => candidate.name === "intercom")!;
+    // One message from the orchestrator, then the worker answers with a plain send (no replyTo).
+    await orchestrator.send(worker.id, { messageId: "infer-request-1", text: "Please report progress." });
+    await waitUntil(() => harness.sentMessages.some((m) => (m.message.details as { message?: { id?: string } } | undefined)?.message?.id === "infer-request-1"), "the request");
+    const onWire = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+    await tool.execute("infer-answer", { action: "send", to: "orchestrator", message: "Progress: half done." }, new AbortController().signal, undefined, harness.ctx);
+    const [, wireMessage] = await onWire;
+    assert.equal(wireMessage.replyTo, undefined, "the guess is NOT put on the wire");
+    const entry = sentEntries(harness).find((e) => e.message?.text === "Progress: half done.")!;
+    assert.equal(entry.message.replyTo, undefined);
+    assert.equal(entry.replyToInferred.id, "infer-request-1");
+    assert.equal(entry.replyToInferred.basis, "sole_unanswered_message_from_peer");
+    // The next send has nothing left to answer.
+    await tool.execute("infer-again", { action: "send", to: "orchestrator", message: "One more thing." }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(sentEntries(harness).find((e) => e.message?.text === "One more thing.")!.replyToInferred, undefined);
+    // Two unanswered messages: no guess. An explicit replyTo is used as given and not "inferred".
+    await orchestrator.send(worker.id, { messageId: "infer-request-2", text: "First new request." });
+    await orchestrator.send(worker.id, { messageId: "infer-request-3", text: "Second new request." });
+    const receivedIds = () => harness.sentMessages.map((m) => (m.message.details as { message?: { id?: string } } | undefined)?.message?.id);
+    await waitUntil(() => receivedIds().includes("infer-request-2") && receivedIds().includes("infer-request-3"), "the two new requests");
+    const ambiguousResult = await tool.execute("infer-ambiguous", { action: "send", to: "orchestrator", message: "Reply to both?" }, new AbortController().signal, undefined, harness.ctx);
+    assert.notEqual(ambiguousResult.details?.error, true);
+    assert.equal(sentEntries(harness).find((e) => e.message?.text === "Reply to both?")!.replyToInferred, undefined);
+    // The broker refuses replyTo for a plain message (only asks can be replied to): this is why a text tag exists.
+    await orchestrator.send(worker.id, { messageId: "infer-request-4", text: "Explicit one." });
+    await waitUntil(() => receivedIds().includes("infer-request-4"), "the fourth request");
+    const refused = await tool.execute("infer-replyto", { action: "send", to: "orchestrator", replyTo: "infer-request-4", message: "Via replyTo." }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(refused.details?.delivered, false);
+    assert.equal(refused.details?.code, "E_REPLY_TARGET");
+    assert.match(String(refused.content[0]?.text), /does not match a pending ask/);
+    // The tag is explicit: recorded as threadRef, checked against what this peer really sent, and it replaces any guess.
+    const tagged = await tool.execute("infer-tag", { action: "send", to: "orchestrator", message: "[RE:infer-request-4] Explicitly threaded." }, new AbortController().signal, undefined, harness.ctx);
+    assert.notEqual(tagged.details?.error, true);
+    const taggedEntry = sentEntries(harness).find((e) => e.message?.text?.endsWith("Explicitly threaded."))!;
+    assert.deepEqual(taggedEntry.threadRef, { id: "infer-request-4", source: "text_tag", fromThisPeer: true });
+    assert.equal(taggedEntry.replyToInferred, undefined);
+    assert.equal(taggedEntry.message.replyTo, undefined);
+    await tool.execute("infer-badtag", { action: "send", to: "orchestrator", message: "[RE:not-a-real-message-id] Tag for nothing." }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(sentEntries(harness).find((e) => e.message?.text?.endsWith("Tag for nothing."))!.threadRef.fromThisPeer, false);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("a reply to an ask records the recipient, and an ask is never guessed as a plain answer", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("reply-trace-worker");
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const worker = await waitForSessionByName(planner, "reply-trace-worker");
+    assert.equal((await orchestrator.send(worker.id, { messageId: "trace-ask-q", text: "Status?", expectsReply: true })).delivered, true);
+    await waitUntil(() => harness.sentMessages.length >= 1, "the ask");
+    const tool = harness.tools.find((candidate) => candidate.name === "intercom")!;
+    const result = await tool.execute("trace-reply", { action: "reply", replyTo: "trace-ask-q", message: "Fine." }, new AbortController().signal, undefined, harness.ctx);
+    assert.notEqual(result.details?.error, true, result.content[0]?.text);
+    const entry = sentEntries(harness).find((e) => e.message?.text === "Fine.")!;
+    assert.equal(entry.v, 1);
+    assert.equal(entry.message.replyTo, "trace-ask-q");
+    assert.equal(entry.recipient.name, "orchestrator");
+    assert.equal(entry.replyToInferred, undefined);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+// ---- LOCAL-WI-006: an open ask_user form is not cancelled by an incoming intercom message
+// The shield exists for the old PI WEB form model; the tests pick a model with PI_INTERCOM_ASK_MODEL (a real daemon says it).
+async function withAskModel<T>(model: "legacy" | "durable", fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.PI_INTERCOM_ASK_MODEL;
+  process.env.PI_INTERCOM_ASK_MODEL = model;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.PI_INTERCOM_ASK_MODEL;
+    else process.env.PI_INTERCOM_ASK_MODEL = previous;
+  }
+}
+const askPosted = (askId: string, at = Date.now()) => ({ type: "message", timestamp: new Date(at).toISOString(), message: { role: "toolResult", toolName: "ask_user", isError: false, details: { ask: { askId, askedAt: new Date(at).toISOString() } } } });
+const askClosed = (askId: string) => ({ type: "custom_message", customType: "pi-web.ask.answers", details: { askId, reason: "submitted" }, timestamp: new Date().toISOString() });
+const receivedIds = (harness: ReturnType<typeof createExtensionHarness>) => harness.sentMessages.map((m) => (m.message.details as { message?: { id?: string } } | undefined)?.message?.id);
+
+test("while a form is open an idle session takes the message without a turn and without the synthetic user line", { concurrency: false }, () => withAskModel("legacy", async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const entries: unknown[] = [];
+  const harness = createExtensionHarness("shield-worker", { sessionId: "shield-worker-pi-id", hasUI: true, sessionEntries: entries, ui: { notify: () => undefined, confirm: async () => true } });
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const worker = await waitForSessionByName(planner, "shield-worker");
+    // A form posted during this runtime is open.
+    entries.push(askPosted("form-1"));
+    await planner.send(worker.id, { messageId: "shielded-1", text: "A plain update while the form is open." });
+    await waitUntil(() => receivedIds(harness).includes("shielded-1"), "the shielded message");
+    const sent = harness.sentMessages.find((m) => (m.message.details as { message?: { id?: string } }).message?.id === "shielded-1")!;
+    assert.deepEqual(sent.options, { deliverAs: "steer" }, "delivered without starting a turn");
+    assert.deepEqual(harness.userMessages, [], "no synthetic user message that PI WEB would take for an answer");
+    assert.equal((sent.message.details as { queuedBehindAsk?: string }).queuedBehindAsk, "form-1");
+    // The form is answered: the next message starts a turn as usual.
+    entries.push(askClosed("form-1"));
+    await planner.send(worker.id, { messageId: "after-form", text: "Now the form is closed." });
+    await waitUntil(() => receivedIds(harness).includes("after-form"), "the message after the form");
+    const after = harness.sentMessages.find((m) => (m.message.details as { message?: { id?: string } }).message?.id === "after-form")!;
+    assert.notDeepEqual(after.options, { deliverAs: "steer" }, "no longer shielded");
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+}));
+
+test("the shield tells the sender nothing was started, notifies the user, and can be switched off or made to yield to [URGENTE]", { concurrency: false }, () => withAskModel("legacy", async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const entries: unknown[] = [];
+  const notices: string[] = [];
+  const harness = createExtensionHarness("shield-notify-worker", { sessionId: "shield-notify-pi-id", hasUI: true, sessionEntries: entries, ui: { notify: (message: string) => { notices.push(message); }, confirm: async () => true } });
+  const receipts: Array<{ messageId: string; status: string; detail?: string }> = [];
+  planner.onMessageReceipt((_from, receipt) => { receipts.push(receipt); });
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const worker = await waitForSessionByName(planner, "shield-notify-worker");
+    entries.push(askPosted("form-2"));
+    await planner.send(worker.id, { messageId: "n-1", text: "First while the form is open." });
+    await waitUntil(() => receipts.some((r) => r.messageId === "n-1" && r.status === "injected"), "the injected receipt");
+    assert.match(receipts.find((r) => r.messageId === "n-1" && r.status === "injected")!.detail ?? "", /queued behind an open ask_user form/);
+    assert.ok(notices.some((n) => /1 intercom message waiting while your questions are open/.test(n)), JSON.stringify(notices));
+    // Urgent: shielded too, with a warning that names it.
+    await planner.send(worker.id, { messageId: "n-2", text: "[URGENTE] Production alert." });
+    await waitUntil(() => notices.some((n) => /URGENT message/.test(n)), "the urgent notice");
+    const urgent = harness.sentMessages.find((m) => (m.message.details as { message?: { id?: string } }).message?.id === "n-2")!;
+    assert.deepEqual(urgent.options, { deliverAs: "steer" });
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+  await withIntercomConfig({ shieldUrgent: "trigger" }, async () => {
+    const { planner: p2, cleanup: c2 } = await setupClients();
+    const urgentEntries: unknown[] = [];
+    const h2 = createExtensionHarness("shield-trigger-worker", { sessionId: "shield-trigger-pi-id", hasUI: true, sessionEntries: urgentEntries, ui: { notify: () => undefined, confirm: async () => true } });
+    try {
+      piIntercomExtension(h2.pi as never);
+      await h2.emitLifecycle("session_start");
+      const worker = await waitForSessionByName(p2, "shield-trigger-worker");
+      urgentEntries.push(askPosted("form-3"));
+      await p2.send(worker.id, { messageId: "t-1", text: "[URGENTE] Act now." });
+      await waitUntil(() => receivedIds(h2).includes("t-1"), "the urgent message");
+      assert.notDeepEqual(h2.sentMessages[0]!.options, { deliverAs: "steer" }, "shieldUrgent trigger starts the turn");
+    } finally {
+      await h2.emitLifecycle("session_shutdown");
+      await c2();
+    }
+  });
+  await withIntercomConfig({ shieldOpenAsk: false }, async () => {
+    const { planner: p3, cleanup: c3 } = await setupClients();
+    const offEntries: unknown[] = [];
+    const h3 = createExtensionHarness("shield-off-worker", { sessionId: "shield-off-pi-id", hasUI: true, sessionEntries: offEntries, ui: { notify: () => undefined, confirm: async () => true } });
+    try {
+      piIntercomExtension(h3.pi as never);
+      await h3.emitLifecycle("session_start");
+      const worker = await waitForSessionByName(p3, "shield-off-worker");
+      offEntries.push(askPosted("form-4"));
+      await p3.send(worker.id, { messageId: "o-1", text: "Plain message, shield off." });
+      await waitUntil(() => receivedIds(h3).includes("o-1"), "the message");
+      assert.notDeepEqual(h3.sentMessages[0]!.options, { deliverAs: "steer" }, "shieldOpenAsk false: delivered as before");
+    } finally {
+      await h3.emitLifecycle("session_shutdown");
+      await c3();
+    }
+  });
+}));
+
+test("a form that is too old, or posted before this session loaded and unconfirmed, does not hold messages back", { concurrency: false }, () => withAskModel("legacy", async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const entries: unknown[] = [askPosted("ancient", Date.now() - 7 * 3_600_000)];
+  const harness = createExtensionHarness("shield-stale-worker", { sessionId: "shield-stale-pi-id", hasUI: true, sessionEntries: entries, ui: { notify: () => undefined, confirm: async () => true } });
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const worker = await waitForSessionByName(planner, "shield-stale-worker");
+    await planner.send(worker.id, { messageId: "s-1", text: "Update, the old form is long gone." });
+    await waitUntil(() => receivedIds(harness).includes("s-1"), "the message");
+    assert.notDeepEqual(harness.sentMessages[0]!.options, { deliverAs: "steer" }, "too old: delivered as before");
+    // Posted before this runtime started and nobody confirms it is still open: also delivered as before.
+    entries.push(askPosted("earlier", Date.now() - 60 * 60_000));
+    await planner.send(worker.id, { messageId: "s-2", text: "Another update." });
+    await waitUntil(() => receivedIds(harness).includes("s-2"), "the second message");
+    const second = harness.sentMessages.find((m) => (m.message.details as { message?: { id?: string } }).message?.id === "s-2")!;
+    assert.notDeepEqual(second.options, { deliverAs: "steer" });
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+}));
+
+test("with the durable PI WEB form model, or an unknown one, an open form changes nothing: messages are delivered as before", { concurrency: false }, async () => {
+  for (const model of ["durable", undefined] as const) {
+    const previous = process.env.PI_INTERCOM_ASK_MODEL;
+    if (model) process.env.PI_INTERCOM_ASK_MODEL = model; else delete process.env.PI_INTERCOM_ASK_MODEL;
+    const { planner, cleanup } = await setupClients();
+    const { default: piIntercomExtension } = await import("./index.ts");
+    const entries: unknown[] = [];
+    const harness = createExtensionHarness(`shield-model-${model ?? "unknown"}`, { sessionId: `shield-model-${model ?? "unknown"}-pi-id`, hasUI: true, sessionEntries: entries, ui: { notify: () => undefined, confirm: async () => true } });
+    try {
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const worker = await waitForSessionByName(planner, `shield-model-${model ?? "unknown"}`);
+      entries.push(askPosted("form-model"));
+      await planner.send(worker.id, { messageId: `model-${model}`, text: "A plain update." });
+      await waitUntil(() => receivedIds(harness).includes(`model-${model}`), "the message");
+      assert.notDeepEqual(harness.sentMessages[0]!.options, { deliverAs: "steer" }, `model ${model ?? "unknown"}: not held back`);
+      assert.equal((harness.sentMessages[0]!.message.details as { queuedBehindAsk?: string }).queuedBehindAsk, undefined);
+    } finally {
+      await harness.emitLifecycle("session_shutdown");
+      await cleanup();
+      if (previous === undefined) delete process.env.PI_INTERCOM_ASK_MODEL; else process.env.PI_INTERCOM_ASK_MODEL = previous;
+    }
   }
 });

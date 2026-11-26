@@ -183,3 +183,37 @@ test("archive reads the failures: the daemon answers 200 even for a session it r
     });
   }
 });
+
+test("pendingAsk reads the status of the asking session only, and says whether a form is open", async () => {
+  const ID = "0198-asking-session";
+  await withDaemon((req, _b, res) => json(res, 200, req.url?.startsWith(`/sessions/${ID}/status`) ? { sessionId: ID, pendingAsk: { askId: "ask-1", questions: [] } } : {}), async (socketPath, requests) => {
+    const provider = createSessiondProvider({ sessiondSocket: socketPath });
+    assert.deepEqual(await provider.pendingAsk!({ piSessionId: ID, cwd: "/repo" }), { open: true, askId: "ask-1" });
+    assert.deepEqual(requests.map((r) => `${r.method} ${r.url.split("?")[0]}`), [`GET /sessions/${ID}/status`]);
+    assert.equal(new URL(requests[0]!.url, "http://x").searchParams.get("cwd"), "/repo");
+  });
+  await withDaemon((_r, _b, res) => json(res, 200, { sessionId: ID }), async (socketPath) => {
+    assert.deepEqual(await createSessiondProvider({ sessiondSocket: socketPath }).pendingAsk!({ piSessionId: ID, cwd: "/repo" }), { open: false });
+  });
+});
+
+test("pendingAsk fails closed when the daemon cannot tell", async () => {
+  const ID = "0198-asking-session";
+  await withDaemon((_r, _b, res) => json(res, 404, { error: "Session not found" }), async (socketPath) => {
+    await expectWakeError(createSessiondProvider({ sessiondSocket: socketPath }).pendingAsk!({ piSessionId: ID, cwd: "/repo" }), "unsupported", true);
+  });
+  await expectWakeError(createSessiondProvider({ sessiondSocket: "/nonexistent/sessiond.sock" }).pendingAsk!({ piSessionId: ID, cwd: "/repo" }), "unavailable", true);
+  await expectWakeError(createSessiondProvider({}, {}).pendingAsk!({ piSessionId: "../etc", cwd: "/repo" }), "rejected", true);
+});
+
+test("runtimeVersion reads the daemon version and fails closed on anything else", async () => {
+  await withDaemon((_r, _b, res) => json(res, 200, health), async (socketPath) => {
+    assert.equal(await createSessiondProvider({ sessiondSocket: socketPath }).runtimeVersion!(), "1.202610.1");
+  });
+  await withDaemon((_r, _b, res) => json(res, 200, { ok: true, version: { component: "web" } }), async (socketPath) => {
+    await expectWakeError(createSessiondProvider({ sessiondSocket: socketPath }).runtimeVersion!(), "unsupported", true);
+  });
+  await withDaemon((_r, _b, res) => json(res, 200, { ok: true, version: { component: "sessiond" } }), async (socketPath) => {
+    assert.equal(await createSessiondProvider({ sessiondSocket: socketPath }).runtimeVersion!(), undefined, "a daemon that does not say its version");
+  });
+});

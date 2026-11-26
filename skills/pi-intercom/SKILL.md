@@ -275,6 +275,14 @@ It only works when `wake.enabled` is set, asks the user to confirm, and never ap
 If the result says the outcome is unconfirmed or unknown, the message is still held: do not resend it. Never put secrets in the message.
 A session the user trusted with `/wake-trust on` wakes without a dialog; only the user can grant or revoke that, never ask to be trusted on your own initiative.
 
+## While You Are Asking the User
+
+On PI WEB older than 1.202610.2, if you posted an `ask_user` form, intercom messages that arrive before the user answers are queued in the transcript without starting a turn, so the form survives; you will see them, with the answers, in the turn that follows. Do not ask peers to stay silent for this reason, and do not open a second form just because a message arrived. An `[URGENTE]` message is also queued and the user is warned.
+
+## Answering a Message in the Same Thread
+
+`replyTo` only works for answering an `ask` (the broker rejects it for a plain message). To answer a plain message so that a tracer can link your answer to it, begin your message with the tag shown in the received message: `[RE:<message id>]` (after at most one leading tag such as `[INFO]`). Do not invent ids.
+
 ## Creating a Session in Another Project
 
 To start a NEW session in another project and give it a task, use
@@ -283,8 +291,9 @@ It works only when `wake.enabled` is set and the directory is in `wake.allowCwds
 The new session starts with that project's defaults; you cannot choose its model or tools. It answers through intercom like any other session.
 Use `send` with `wakeIfDisconnected` instead when the project already has a saved session for the work. A session created by `spawn` cannot spawn others. Do not spawn repeatedly or in loops, and never put secrets in the task.
 
-To tidy up a session you created with `spawn`, use `intercom({ action: "archive", to: "<full Pi session id>", cwd: "/abs/path" })`.
-It only works for sessions you created, the user is always asked (even with `/wake-trust`), it is reversible, and it is refused while the session is working or if it never answered. Never archive on your own initiative while the session may still be needed.
+To tidy up a session you created with `spawn`, or one of your own tracked subsessions (`spawn_subsession`), use `intercom({ action: "archive", to: "<full Pi session id>" })`, or several at once with `ids: ["<id>", ...]` (up to 10, one confirmation lists them).
+It only works for sessions that are yours, the user is always asked (even with `/wake-trust`), it is reversible, and it is refused while a session is working, if it is not saved yet, or if it was active in the last few minutes. Never archive on your own initiative while a session may still be needed.
+If the user ran `/archive-trust on` in this session and `wake.autoArchive` is on, your finished direct subsessions are archived by themselves, without asking; you will see a note. Call `intercom({ action: "keep", to: "<id>" })` on a subsession whose result you still need (`unkeep` to undo). Never ask to be given `/archive-trust` and never try to get around the confirmation.
 
 ## Important Constraints
 

@@ -456,6 +456,7 @@ Create `~/.pi/agent/intercom/config.json`:
   "busyDelivery": "steer",
   "enabled": true,
   "replyHint": true,
+  "showInChat": false,
   "status": "researching",
   "crossMachine": {
     "machineName": "laptop",
@@ -469,13 +470,25 @@ Create `~/.pi/agent/intercom/config.json`:
 | `brokerCommand` | `"npx"` | Advanced trusted override for the broker executable. The default value is hardened internally to run the broker in the current Node executable with the resolved bundled `tsx` loader instead of resolving `npx` through `PATH`. A custom command is spawned directly without a shell, so on Windows it must name an executable such as `bun`, not a `.cmd` shim such as `npx`. |
 | `brokerArgs` | `["--no-install", "tsx"]` | Advanced trusted arguments passed to custom `brokerCommand` before the broker script path |
 | `confirmSend` | false | Show a confirmation dialog before ordinary or inferred sends from an interactive session with UI; caller-supplied `replyTo` skips it |
+| `shieldOpenAsk` / `shieldUrgent` / `shieldMaxAgeMs` | `true` / `"notify"` / 21600000 | Keep an open `ask_user` form from being cancelled by incoming messages (see below). |
 | `inboundTrigger` | `"always"` | Auto-trigger policy for inbound broker messages: `"always"`, `"replies"`, or `"never"`. Local in-process subagent relay events still trigger the addressed session. |
 | `busyDelivery` | `"steer"` | `"steer"` promptly steers peers into active interactive runs. Opt into `"human-first"` to hold peers until a turn boundary with no pending human input; one held peer is released per turn. Non-interactive busy behavior is unchanged. |
 | `enabled` | true | Enable/disable intercom entirely |
 | `replyHint` | true | Include reply instruction in incoming messages |
+| `showInChat` | false | Render incoming intercom messages in the chat transcript. Off by default: they are service traffic. A hidden message is still delivered to the model and recorded in the session (`display: false`), it is just not drawn. `PI_INTERCOM_DEBUG=1` or `/intercom-debug on` turn it on for debugging (see below). |
 | `status` | — | Optional custom status suffix shown after the automatic lifecycle status, for example `thinking · researching` |
 | `crossMachine.machineName` | lowercased short hostname | Name peers use for this host in their Herdr saved-machine lists |
 | `crossMachine.remoteCommand` | `"pi-intercom"` | Command invoked through non-interactive SSH on remote machines |
+
+#### Hiding intercom traffic from the chat (fork)
+
+Incoming messages are not drawn in the chat unless you ask for it. The model still receives every message and replies as usual; the entry is kept in the session file with `display: false`, so debugging from the file is still possible. To see them:
+
+- `/intercom-debug on` (this session only, not persisted; `off` hides them again, `reset` goes back to the configured value, `status` shows the current state and where it comes from), or
+- `PI_INTERCOM_DEBUG=1` in the environment of the Pi process (also `true`, `on`, `yes`), or
+- `"showInChat": true` in `config.json`.
+
+The switch applies to messages received after it is changed. Order of precedence: `/intercom-debug` > `PI_INTERCOM_DEBUG` > `showInChat`. Tool calls of the `intercom` tool made by the agent are ordinary tool calls and are not affected. The notice of automatic archiving (`intercom_auto_archive`) stays visible because it reports an action taken on your sessions.
 
 If `config.json` cannot be parsed or contains an invalid value, pi-intercom logs the error and fails closed for inbound broker auto-triggering by using `inboundTrigger: "never"` until the config is fixed.
 Obsolete `toolVisibility` values are ignored; the generic `intercom` tool remains stable in the active tool set for prompt-cache friendliness.
@@ -524,7 +537,7 @@ This feature ships in a fork of pi-intercom published as the package **`pi-inter
 pi remove npm:pi-intercom
 pi install npm:pi-intercom-wake                                   # from npm
 # or, pinned to a release tag, straight from GitHub:
-pi install git:github.com/mocvin/pi-intercom@v0.18.0-wake.4
+pi install git:github.com/mocvin/pi-intercom@v0.18.0-wake.7
 ```
 
 Then restart the intercom broker once (it is a long-lived process that keeps running the old code) and `/reload` the sessions; see [`docs/session-waker/INSTALL.md`](docs/session-waker/INSTALL.md). Sessions that still run the original pi-intercom keep working with this broker, and the other way round. To go back, remove `pi-intercom-wake`, install `npm:pi-intercom` again, and restart the broker.
@@ -565,7 +578,11 @@ It is **off by default** and fail-closed. Settings under `wake` in `config.json`
 | `wake.sessiondSocket` / `wake.sessiondUrl` | — | Endpoint of the PI WEB session daemon. Otherwise `PI_WEB_SESSIOND_SOCKET` / `PI_WEB_SESSIOND_URL` is used. The endpoint is never guessed. A daemon started with its default socket does not export it to its sessions, so set `wake.sessiondSocket` (usually `~/.pi-web/sessiond.sock`, as an absolute path). |
 | `wake.spawnConfirm` | `"always"` | Whether `spawn` (creating a session in another project) asks the user. `"always"` asks every time, `/wake-trust` senders included, and blocks when there is no UI. `"trusted"` lets `/wake-trust` senders skip the dialog. `"never"` never asks (allowlisted directories only). |
 | `wake.spawnMax` / `wake.spawnWindowMs` | 5 / 3600000 | Sessions `spawn` may create per window, across all senders. |
-| `wake.archiveMax` | 10 | `archive` actions allowed per `wake.spawnWindowMs`. Archiving always asks the user; there is no setting for that. |
+| `wake.archiveMax` | 30 | Sessions archived with confirmation per `wake.spawnWindowMs` (a batch counts every session). Archiving by hand always asks the user; there is no setting for that. |
+| `wake.autoArchive` | `"off"` | Global safety switch for automatic archiving of finished subsessions. `"trusted-children"` lets a parent session that the user allowed with `/archive-trust` do it. Off, nothing is archived automatically, whatever the permissions. |
+| `wake.archiveTrustDays` | 30 | Lifetime of an `/archive-trust` grant. |
+| `wake.autoArchiveMax` | 10 | Sessions archived automatically per `wake.spawnWindowMs`, across all parents (and at most 3 per minute round). |
+| `wake.archiveMinIdleMs` | 600000 | A session must have been idle this long before it is archived in a batch or automatically. |
 | `wake.dedupMs` | 600000 | An identical message to the same session inside this window is refused. |
 | `wake.perTargetMax` / `wake.perTargetWindowMs` | 3 / 600000 | Wakes allowed per session per window. |
 | `wake.globalMax` / `wake.globalWindowMs` | 10 / 3600000 | Wakes allowed in total per window, across all sessions of the user. |
@@ -604,7 +621,42 @@ The directory must be in `wake.allowCwds`, and `wake.enabled` must be on. By def
 intercom({ action: "archive", to: "<full Pi session id returned by spawn>", cwd: "/home/me/projects/other-app" })
 ```
 
-Tidies up a session the same sender created with `spawn`. **The user is always asked**: no setting and no `/wake-trust` grant removes the dialog, and without a UI nothing happens. Only sessions that the audit shows this sender created can be archived (anything else the user archives in PI WEB). The archive is reversible: the session is closed and moved to PI WEB's archive, never deleted, and can be restored there. PI WEB refuses to archive a session that is working (the action reports it as busy; try again when it is idle). A session that never answered has no saved file yet and cannot be archived; PI WEB reports that.
+Tidies up a session the same sender created with `spawn`, or one of its **own tracked subsessions** (the children it started with PI WEB's `spawn_subsession`, which PI WEB records in the parent's own session entries). **The user is always asked**: no setting and no `/wake-trust` grant removes the dialog, and without a UI nothing happens. Anything else the user archives in PI WEB. `cwd` is optional: the directory is known for both kinds.
+
+To clear several at once, pass a list: `intercom({ action: "archive", ids: ["<id>", "<id>"] })` (up to 10). **One** dialog lists them (name, id, idle time) and each session gets its own result. Each must be saved, not archived yet, and idle for `wake.archiveMinIdleMs`; ones that are not are reported and skipped. The archive is reversible: the session is closed and moved to PI WEB's archive, never deleted, and can be restored there. PI WEB refuses to archive a session that is working (the action reports it as busy; try again when it is idle). A session that never answered has no saved file yet and cannot be archived; PI WEB reports that.
+
+#### Open `ask_user` forms are not cancelled by incoming messages
+
+**This only concerns PI WEB older than 1.202610.2.** From 1.202610.2 on a form is a durable transcript entry: nothing cancels it, an intercom message cannot take it away, and answers or skips are ordinary replies. The shield reads the session daemon's runtime version and stays out of the way on those versions (and when the version cannot be read), so messages are delivered as usual. On the older model, PI WEB cancels a session's open `ask_user` form, and the answers the user had typed so far, whenever a message with role `user` starts in the session; a model turn can also open a new form that replaces it. An intercom message used to start such a turn (and, on Pi before 1.2, a synthetic user line). **While a form is open, an incoming message is now delivered without starting a turn**: it shows in the transcript, it is in the model's context for the turn that the form's answers start, the sender's receipt says `queued behind an open ask_user form`, and the user gets a short notice. An `[URGENTE]` message queues too and the notice names it, because starting its turn would cancel the form; set `shieldUrgent` to `"trigger"` to let urgent messages start the turn anyway.
+
+The form is recognised from the session's own entries (an `ask_user` tool result opens it, a `pi-web.ask.answers` message closes it) and, when the session daemon can be reached, confirmed with it. Every doubt means "deliver as before": a form older than `shieldMaxAgeMs`, one that the daemon says is no longer open, or one posted before this session was loaded and not confirmed. Settings: `shieldOpenAsk` (default `true`; `false` restores the old behavior), `shieldUrgent` (`"notify"` default or `"trigger"`), `shieldMaxAgeMs` (default 6 hours). A user who types a chat message instead of answering still cancels the form, by design of PI WEB.
+
+#### Data for tracing requests and answers
+
+A read-only tracing tool can follow who asked whom and what came of it from the session files alone (schema `v: 1`, nothing is sent over the wire, nothing enters the model's context):
+
+| Entry | Fields |
+|---|---|
+| `intercom_sent` | `v`, `to`, `message{text, replyTo, supersedes, retryOf, attachments}`, `messageId`, `timestamp`, `delivery` (`socket_delivered` / `queued`), `expectsReply` (asks), `recipient{id, piSessionId, cwd, name}`, `threadRef`, `replyToInferred`, plus `wake` / `extension` / `subagent` where they apply |
+| `intercom_receipt` | `v`, `messageId`, `status`, `timestamp`, `detail`, `from{id, piSessionId, cwd, name}`: one per receipt the receiver reports for a message this session sent. It can precede the `intercom_sent` entry of the same message: join by `messageId`. |
+
+The broker accepts `replyTo` only for an ask that is pending between the two sessions, so a plain message cannot be answered "in thread" on the wire. A plain message therefore tells the model to begin its answer with `[RE:<message id>]`; the sender records it as `threadRef: { id, source: "text_tag", fromThisPeer }` (`fromThisPeer` says whether that id really is a recent message from that recipient). `replyToInferred: { id, basis, ageMs }` is a best guess (exactly one recent plain message from that peer that this session had not answered yet) and lives only in the sender's entry. `replyHint: false` in the config removes the hint from received messages.
+
+#### Subsessions that clean up after themselves: `/archive-trust` and `keep`
+
+Temporary subsessions that a parent started with `spawn_subsession` can disappear on their own when their work is done, **without asking each time**, if two things are both true:
+
+1. `wake.autoArchive` is `"trusted-children"` in the intercom config (it is `"off"` by default: a global safety switch), **and**
+2. the user ran `/archive-trust on` **in the parent session** and confirmed the dialog. This is a different permission from `/wake-trust` (which only allows waking sessions): it has its own command, its own file (`archive-trust.json`), its own expiry (`wake.archiveTrustDays`) and its own dialog that says what it does. Only the user can grant or revoke it, and a session without a UI cannot.
+
+| Command | Effect |
+|---|---|
+| `/archive-trust on` | Allow this session to archive its own finished subsessions by itself (asks for confirmation) |
+| `/archive-trust off` | Remove this session's permission (asks for confirmation) |
+| `/archive-trust status` | Show the global switch and this session's permission |
+| `/archive-trust list` / `revoke <Pi session id>` | List or remove grants |
+
+What gets archived: **direct children only**, once PI WEB has delivered the child's completion to the parent, nothing has happened to the child since, it has been idle for `wake.archiveMinIdleMs`, it is saved, and it has no live subsessions of its own. A child that is still working is left alone and tried again later (PI WEB refuses it by itself). Mark a child you want to keep with `intercom({ action: "keep", to: "<id>" })` (`unkeep` removes the mark). Sessions are archived, never deleted: restore them from PI WEB's archive. Every one is recorded in the audit as `archive_auto` / `archive-trust` (id, name, time, parent; no text), the parent gets a note in its transcript (without a model turn), and at most 3 are archived per minute round and `wake.autoArchiveMax` per hour. The permission only applies while the parent session is open. If the permission expires or is removed, or the global switch is off, children stay and the manual `archive` (with confirmation) still works.
 
 Messages that look like secrets (tokens, private keys, passwords) or exceed 32 KiB are refused. Every attempt is recorded in `wake-audit.jsonl` next to `config.json` (mode 0600): time, outcome, ids, directory, text length and SHA-256, never the text. The duplicate window and the rate limits are computed from that file, so they hold across all sessions. If the audit cannot be written, nothing is woken. `/intercom-wake-status` shows the settings, whether the broker supports `wake-v1`, and recent attempts.
 

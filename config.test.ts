@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { getConfigPath, loadConfig } from "./config.ts";
+import { getConfigPath, loadConfig, resolveShowInChat } from "./config.ts";
 
 async function withAgentDir<T>(agentDir: string, fn: () => T | Promise<T>): Promise<T> {
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -107,6 +107,32 @@ test("loadConfig ignores obsolete toolVisibility values", async () => {
   }
 });
 
+test("showInChat defaults to false, loads from config and can be forced by env or override", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    await withAgentDir(root, () => {
+      assert.equal(loadConfig().showInChat, false);
+    });
+    mkdirSync(join(root, "intercom"), { recursive: true });
+    writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ showInChat: true }));
+    await withAgentDir(root, () => {
+      assert.equal(loadConfig().showInChat, true);
+    });
+    writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ showInChat: "yes" }));
+    await withAgentDir(root, () => {
+      assert.throws(() => loadConfig(), /"showInChat" must be a boolean/);
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+  assert.equal(resolveShowInChat(false, undefined, {}), false);
+  assert.equal(resolveShowInChat(true, undefined, {}), true);
+  assert.equal(resolveShowInChat(false, undefined, { PI_INTERCOM_DEBUG: "1" }), true);
+  assert.equal(resolveShowInChat(false, undefined, { PI_INTERCOM_DEBUG: "0" }), false);
+  assert.equal(resolveShowInChat(true, false, { PI_INTERCOM_DEBUG: "1" }), false);
+  assert.equal(resolveShowInChat(false, true, {}), true);
+});
+
 test("loadConfig accepts a restart-stable intercom id", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
   try {
@@ -131,6 +157,30 @@ test("loadConfig rejects invalid inboundTrigger values", async () => {
         () => loadConfig(),
         /Failed to load intercom config.*"inboundTrigger" must be "always", "replies", or "never"/,
       );
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig reads and validates the open-form shield settings", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    mkdirSync(join(root, "intercom"), { recursive: true });
+    const write = (value: unknown) => writeFileSync(join(root, "intercom", "config.json"), JSON.stringify(value));
+    await withAgentDir(root, () => {
+      write({ shieldOpenAsk: false, shieldUrgent: "trigger", shieldMaxAgeMs: 1000 });
+      const config = loadConfig();
+      assert.deepEqual([config.shieldOpenAsk, config.shieldUrgent, config.shieldMaxAgeMs], [false, "trigger", 1000]);
+      for (const [bad, message] of [
+        [{ shieldOpenAsk: "yes" }, /"shieldOpenAsk" must be a boolean/],
+        [{ shieldUrgent: "always" }, /"shieldUrgent" must be "notify" or "trigger"/],
+        [{ shieldMaxAgeMs: 0 }, /"shieldMaxAgeMs" must be a positive integer/],
+        [{ shieldMaxAgeMs: 1.5 }, /"shieldMaxAgeMs" must be a positive integer/],
+      ] as const) {
+        write(bad);
+        assert.throws(() => loadConfig(), message);
+      }
     });
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -172,7 +222,9 @@ test("loadConfig leaves waking persisted sessions off, confirmed, and empty by d
       assert.equal(wake.confirm, "always");
       assert.equal(wake.spawnConfirm, "always");
       assert.equal(wake.spawnMax, 5);
-      assert.equal(wake.archiveMax, 10);
+      assert.deepEqual([loadConfig().shieldOpenAsk, loadConfig().shieldUrgent, loadConfig().shieldMaxAgeMs], [true, "notify", 6 * 3_600_000]);
+      assert.equal(wake.archiveMax, 30);
+      assert.deepEqual([wake.autoArchive, wake.archiveTrustDays, wake.autoArchiveMax, wake.archiveMinIdleMs], ["off", 30, 10, 600_000]);
       assert.deepEqual(wake.allowCwds, []);
       assert.equal(wake.provider, "pi-web-sessiond");
       assert.equal(wake.perTargetMax, 3);
@@ -197,6 +249,8 @@ test("loadConfig reads wake settings and rejects unknown or invalid ones", async
       const wake = loadConfig().wake;
       assert.deepEqual([wake.enabled, wake.confirm, wake.perTargetMax, wake.sessiondSocket], [true, "never", 5, "/run/pi-web/sessiond.sock"]);
       assert.deepEqual(wake.allowCwds, ["/work/a", "/work/b"]);
+      write({ autoArchive: "trusted-children" });
+      assert.equal(loadConfig().wake.autoArchive, "trusted-children");
       write({ spawnConfirm: "trusted", spawnMax: 2 });
       assert.deepEqual([loadConfig().wake.spawnConfirm, loadConfig().wake.spawnMax], ["trusted", 2]);
       for (const [bad, message] of [
@@ -205,6 +259,8 @@ test("loadConfig reads wake settings and rejects unknown or invalid ones", async
         [{ allowCwds: "/work" }, /"wake.allowCwds" must be an array of absolute/],
         [{ confirm: "sometimes" }, /"wake.confirm" must be "always" or "never"/],
         [{ spawnConfirm: "sometimes" }, /"wake.spawnConfirm" must be "always", "trusted" or "never"/],
+        [{ autoArchive: "yes" }, /"wake.autoArchive" must be "off" or "trusted-children"/],
+        [{ archiveTrustDays: 0 }, /"wake.archiveTrustDays" must be a positive integer/],
         [{ archiveMax: 0 }, /"wake.archiveMax" must be a positive integer/],
         [{ spawnMax: 0 }, /"wake.spawnMax" must be a positive integer/],
         [{ dedupMs: 0 }, /"wake.dedupMs" must be a positive integer/],

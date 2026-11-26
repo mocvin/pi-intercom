@@ -10,6 +10,7 @@ import { SAFE_MESSAGE_ID, SAFE_SESSION_ID, WAKE_COMMAND_PROMPT, WakeError, type 
  *   GET  /health                               identifies the daemon
  *   GET  /sessions?cwd=<absolute cwd>          read-only catalog of persisted sessions
  *   POST /sessions                             creates a new, empty session in a directory (spawn)
+ *   GET  /sessions/:sessionId/status?cwd=      status of a session that is ALREADY loaded (pendingAsk); never used on a saved one
  *   POST /sessions/bulk/archive                archives sessions (reversible); answers 200 even for sessions it refused
  *   POST /sessions/:sessionId/commands/run     opens a saved session and runs one REGISTERED command
  * commands/run is used instead of /prompt because it refuses a command the session does not have (an intercom
@@ -138,6 +139,9 @@ export function createSessiondProvider(options: { sessiondSocket?: string; sessi
           ...(typeof entry.name === "string" ? { name: entry.name } : {}),
           ...(typeof entry.modified === "string" ? { modified: entry.modified } : {}),
           ...(typeof entry.messageCount === "number" ? { messageCount: entry.messageCount } : {}),
+          ...(typeof entry.path === "string" ? { path: entry.path } : {}),
+          ...(typeof entry.parentSessionPath === "string" ? { parentSessionPath: entry.parentSessionPath } : {}),
+          ...(typeof entry.persisted === "boolean" ? { persisted: entry.persisted } : {}),
         });
       }
       return candidates;
@@ -153,6 +157,21 @@ export function createSessiondProvider(options: { sessiondSocket?: string; sessi
       if (result.status === 400) throw new WakeError("rejected", `The session daemon refused to create a session: ${message || "bad request"}`);
       if (result.status >= 500) throw new WakeError("server_error", `The session daemon failed while creating the session (HTTP ${result.status})`);
       throw new WakeError("unsupported", `Unexpected answer when creating a session (HTTP ${result.status})`);
+    },
+
+    async runtimeVersion(signal) {
+      await identify(10_000, signal);
+      return daemon?.startsWith("sessiond ") ? daemon.slice("sessiond ".length) : undefined;
+    },
+
+    async pendingAsk(target, signal) {
+      if (!SAFE_SESSION_ID.test(target.piSessionId)) throw new WakeError("rejected", "The session id is not valid for a status read");
+      // This route opens a session that is not loaded: it is only called for the session that is asking about itself.
+      const result = await request("GET", `/sessions/${encodeURIComponent(target.piSessionId)}/status?cwd=${encodeURIComponent(target.cwd)}`, undefined, 10_000, signal, false);
+      const answer = result.json as { pendingAsk?: { askId?: unknown } | null } | undefined;
+      if (result.status !== 200 || typeof answer !== "object" || answer === null) throw new WakeError("unsupported", `Unexpected status answer from the session daemon (HTTP ${result.status})`);
+      const askId = answer.pendingAsk && typeof answer.pendingAsk.askId === "string" ? answer.pendingAsk.askId : undefined;
+      return askId ? { open: true, askId } : { open: false };
     },
 
     async archive(target, signal) {

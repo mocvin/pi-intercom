@@ -21,6 +21,17 @@ export function getAskTimeoutMs(): number {
   return value;
 }
 
+/** `PI_INTERCOM_DEBUG=1|true|on|yes` forces incoming messages to be shown in the chat, whatever `showInChat` says. */
+export function isIntercomDebugEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(1|true|on|yes)$/i.test(env.PI_INTERCOM_DEBUG?.trim() ?? "");
+}
+
+/** Whether incoming messages are rendered in the chat: the `/intercom-debug` override wins, then the environment, then the config. */
+export function resolveShowInChat(configValue: boolean, runtimeOverride?: boolean, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (runtimeOverride !== undefined) return runtimeOverride;
+  return isIntercomDebugEnv(env) || configValue;
+}
+
 export function getIntercomScopeId(env: NodeJS.ProcessEnv = process.env): string | undefined {
   const scopeId = env[INTERCOM_SCOPE_ID_ENV]?.trim();
   return scopeId ? scopeId : undefined;
@@ -61,6 +72,18 @@ export interface WakeConfig {
   spawnWindowMs: number;
   /** At most this many `archive` actions per spawnWindowMs. Archiving always asks the user; this is not configurable. */
   archiveMax: number;
+  /**
+   * Global safety switch for automatic archiving of finished tracked subsessions. `off` (default) disables it for every
+   * session; `trusted-children` lets a parent session that the user allowed with /archive-trust do it. A session's own
+   * permission comes only from /archive-trust (a separate permission from /wake-trust), never from this setting.
+   */
+  autoArchive: "off" | "trusted-children";
+  /** Lifetime of an /archive-trust grant, in days. */
+  archiveTrustDays: number;
+  /** At most this many sessions archived automatically per spawnWindowMs, across all parents. */
+  autoArchiveMax: number;
+  /** A session must have been idle at least this long before it is archived in a batch or automatically. */
+  archiveMinIdleMs: number;
   /** A wake with the same target and text inside this window is refused. */
   dedupMs: number;
   perTargetMax: number;
@@ -97,6 +120,21 @@ export interface IntercomConfig {
   /** Controls whether inbound broker messages may automatically trigger a model turn */
   inboundTrigger: InboundTriggerPolicy;
 
+  /**
+   * While an `ask_user` form is open in this session, deliver incoming messages without starting a turn, so the form (and the
+   * user's partial answers) is not cancelled. Default true.
+   */
+  shieldOpenAsk: boolean;
+
+  /**
+   * What an `[URGENTE]` message does while a form is open: `notify` (default) queues it like the others and tells the user at
+   * once; `trigger` starts the turn anyway, which cancels the form.
+   */
+  shieldUrgent: "notify" | "trigger";
+
+  /** A form older than this is no longer protected (it may be a leftover of a restart). */
+  shieldMaxAgeMs: number;
+
   /** Delivery priority for peers arriving during interactive agent runs */
   busyDelivery: BusyDeliveryPolicy;
 
@@ -111,6 +149,13 @@ export interface IntercomConfig {
   
   /** Show reply hint in incoming messages (default: true) */
   replyHint: boolean;
+
+  /**
+   * Show incoming intercom messages in the chat transcript (default: false). When false the message is still delivered to
+   * the model and recorded in the session (`display: false`), it is only not rendered. `PI_INTERCOM_DEBUG=1` or
+   * `/intercom-debug on` turn it on for debugging.
+   */
+  showInChat: boolean;
 
   /** Cross-machine discovery and SSH relay settings. */
   crossMachine: CrossMachineConfig;
@@ -127,7 +172,11 @@ export const defaultWakeConfig = (): WakeConfig => ({
   spawnConfirm: "always",
   spawnMax: 5,
   spawnWindowMs: 60 * 60_000,
-  archiveMax: 10,
+  archiveMax: 30,
+  autoArchive: "off",
+  archiveTrustDays: 30,
+  autoArchiveMax: 10,
+  archiveMinIdleMs: 10 * 60_000,
   dedupMs: 10 * 60_000,
   perTargetMax: 3,
   perTargetWindowMs: 10 * 60_000,
@@ -158,7 +207,7 @@ function parseWakeConfig(value: unknown): WakeConfig {
       wake[key] = raw[key] as boolean;
     }
   };
-  const positive = (key: "dedupMs" | "perTargetMax" | "perTargetWindowMs" | "globalMax" | "globalWindowMs" | "listTimeoutMs" | "wakeTimeoutMs" | "deliveryTimeoutMs" | "receiveTimeoutMs" | "auditMaxEntries" | "auditRetentionDays" | "trustDays" | "spawnMax" | "spawnWindowMs" | "archiveMax") => {
+  const positive = (key: "dedupMs" | "perTargetMax" | "perTargetWindowMs" | "globalMax" | "globalWindowMs" | "listTimeoutMs" | "wakeTimeoutMs" | "deliveryTimeoutMs" | "receiveTimeoutMs" | "auditMaxEntries" | "auditRetentionDays" | "trustDays" | "spawnMax" | "spawnWindowMs" | "archiveMax" | "archiveTrustDays" | "autoArchiveMax" | "archiveMinIdleMs") => {
     if (Object.hasOwn(raw, key)) {
       const n = raw[key];
       if (typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0) throw new Error(`"wake.${key}" must be a positive integer`);
@@ -180,11 +229,15 @@ function parseWakeConfig(value: unknown): WakeConfig {
     if (raw.confirm !== "always" && raw.confirm !== "never") throw new Error(`"wake.confirm" must be "always" or "never"`);
     wake.confirm = raw.confirm;
   }
+  if (raw.autoArchive !== undefined) {
+    if (raw.autoArchive !== "off" && raw.autoArchive !== "trusted-children") throw new Error(`"wake.autoArchive" must be "off" or "trusted-children"`);
+    wake.autoArchive = raw.autoArchive;
+  }
   if (raw.spawnConfirm !== undefined) {
     if (raw.spawnConfirm !== "always" && raw.spawnConfirm !== "trusted" && raw.spawnConfirm !== "never") throw new Error(`"wake.spawnConfirm" must be "always", "trusted" or "never"`);
     wake.spawnConfirm = raw.spawnConfirm;
   }
-  for (const key of ["dedupMs", "perTargetMax", "perTargetWindowMs", "globalMax", "globalWindowMs", "listTimeoutMs", "wakeTimeoutMs", "deliveryTimeoutMs", "receiveTimeoutMs", "auditMaxEntries", "auditRetentionDays", "trustDays", "spawnMax", "spawnWindowMs", "archiveMax"] as const) positive(key);
+  for (const key of ["dedupMs", "perTargetMax", "perTargetWindowMs", "globalMax", "globalWindowMs", "listTimeoutMs", "wakeTimeoutMs", "deliveryTimeoutMs", "receiveTimeoutMs", "auditMaxEntries", "auditRetentionDays", "trustDays", "spawnMax", "spawnWindowMs", "archiveMax", "archiveTrustDays", "autoArchiveMax", "archiveMinIdleMs"] as const) positive(key);
   for (const key of ["sessiondSocket", "sessiondUrl"] as const) {
     if (Object.hasOwn(raw, key)) {
       if (typeof raw[key] !== "string" || !(raw[key] as string).trim()) throw new Error(`"wake.${key}" must be a non-empty string`);
@@ -203,9 +256,13 @@ const defaults: IntercomConfig = {
   brokerArgs: ["--no-install", "tsx"],
   confirmSend: false,
   inboundTrigger: "always",
+  shieldOpenAsk: true,
+  shieldUrgent: "notify",
+  shieldMaxAgeMs: 6 * 60 * 60_000,
   busyDelivery: "steer",
   enabled: true,
   replyHint: true,
+  showInChat: false,
   crossMachine: {
     machineName: defaultMachineName(hostname()),
     remoteCommand: "pi-intercom",
@@ -269,6 +326,28 @@ export function loadConfig(): IntercomConfig {
       config.confirmSend = parsedConfig.confirmSend;
     }
 
+    if (Object.hasOwn(parsedConfig, "shieldOpenAsk")) {
+      if (typeof parsedConfig.shieldOpenAsk !== "boolean") {
+        throw new Error(`"shieldOpenAsk" must be a boolean`);
+      }
+      config.shieldOpenAsk = parsedConfig.shieldOpenAsk;
+    }
+
+    if (Object.hasOwn(parsedConfig, "shieldUrgent")) {
+      if (parsedConfig.shieldUrgent !== "notify" && parsedConfig.shieldUrgent !== "trigger") {
+        throw new Error(`"shieldUrgent" must be "notify" or "trigger"`);
+      }
+      config.shieldUrgent = parsedConfig.shieldUrgent;
+    }
+
+    if (Object.hasOwn(parsedConfig, "shieldMaxAgeMs")) {
+      const value = parsedConfig.shieldMaxAgeMs;
+      if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+        throw new Error(`"shieldMaxAgeMs" must be a positive integer`);
+      }
+      config.shieldMaxAgeMs = value;
+    }
+
     if (Object.hasOwn(parsedConfig, "enabled")) {
       if (typeof parsedConfig.enabled !== "boolean") {
         throw new Error(`"enabled" must be a boolean`);
@@ -299,6 +378,13 @@ export function loadConfig(): IntercomConfig {
         throw new Error(`"replyHint" must be a boolean`);
       }
       config.replyHint = parsedConfig.replyHint;
+    }
+
+    if (Object.hasOwn(parsedConfig, "showInChat")) {
+      if (typeof parsedConfig.showInChat !== "boolean") {
+        throw new Error(`"showInChat" must be a boolean`);
+      }
+      config.showInChat = parsedConfig.showInChat;
     }
 
     if (Object.hasOwn(parsedConfig, "status")) {

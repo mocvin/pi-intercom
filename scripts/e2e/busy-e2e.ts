@@ -9,6 +9,9 @@
 import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { defaultWakeConfig } from "../../config.ts";
+import { WakeAudit, wakeAuditPath } from "../../wake/audit.ts";
+import { performArchiveMany, performAutoArchive } from "../../wake/controller.ts";
 import { createSessiondProvider } from "../../wake/sessiond.ts";
 
 const root = process.env.WAKER_E2E_ROOT ?? "";
@@ -62,6 +65,8 @@ function transcript(id: string): any[] {
 const userWakeMessages = (entries: any[]) => entries.filter((e) => e.type === "message" && e.message?.role === "user" && JSON.stringify(e.message.content).includes("/intercom-wake")).length;
 const wakeEntries = (entries: any[]) => entries.filter((e) => e.type === "custom" && e.customType === "intercom_wake");
 const provider = createSessiondProvider({ sessiondSocket: socket });
+/** An open form: `pendingAsk` on PI WEB 1.202610.1, an unanswered ask_user result in the transcript from 1.202610.2 on. */
+const formOpen = async (id: string): Promise<boolean> => Boolean((await status(id)).pendingAsk) || transcript(id).some((e) => e.type === "message" && e.message?.role === "toolResult" && e.message?.toolName === "ask_user" && e.message?.isError === false);
 async function wakeVia(method: "M1-prompt" | "M2-commands", id: string, messageId: string): Promise<string> {
   if (method === "M2-commands") {
     try { await provider.wake({ piSessionId: id, cwd: work }, messageId); return "accepted (provider)"; } catch (error) { return `error: ${(error as Error).message}`; }
@@ -132,14 +137,14 @@ for (const method of methods) {
 for (const method of methods) {
   const id = await newSession();
   await prompt(id, "ASKFORM please");
-  await waitFor("form open", async () => (await idle(id)) && Boolean((await status(id)).pendingAsk));
+  await waitFor("form open", async () => (await idle(id)) && (await formOpen(id)));
   const before = modelCalls().length;
   note("S4 open form", method, "wake answer", await wakeVia(method, id, `probe-s4-${method}`));
   await sleep(2500);
   await waitFor("idle", () => idle(id));
   const s = await status(id);
   const entries = transcript(id);
-  note("S4 open form", method, "form still open after the wake", Boolean(s.pendingAsk));
+  note("S4 open form", method, "form still open after the wake", await formOpen(id));
   note("S4 open form", method, "extra model calls after the wake", modelCalls().slice(before).filter((c) => !String(c.lastUser).startsWith("Create a 2-6 word title")).length);
   note("S4 open form", method, "wake prompt stored as a user message", userWakeMessages(entries));
   note("S4 open form", method, "voided-form note added to the transcript", entries.filter((e) => e.type === "custom_message" && /ask/i.test(e.customType ?? "")).map((e) => e.customType));
@@ -202,6 +207,54 @@ for (const method of methods) {
   const emptyResult = await tryArchive(emptyId);
   note("S6 archive", "provider", "a new session that never answered (not persisted)", emptyResult);
   expect("S6: a never-answered session is never reported archived unless the catalog says so", emptyResult !== "archived" || (await archivedIds()).includes(emptyId), emptyResult);
+}
+
+// ---- S7: LOCAL-WI-005 against the real daemon: a batch with one confirmation, and automatic archiving of finished children.
+{
+  const archivedIds = async () => ((await daemon("GET", `/sessions?${q}`)).json as any[]).filter((e) => e.archived === true).map((e) => e.id as string);
+  const answered = async (): Promise<string> => { const id = await newSession(); await prompt(id, "hello"); await waitFor("idle session ready", async () => (await idle(id)) && transcript(id).some((e) => e.message?.role === "assistant")); return id; };
+  const audit = new WakeAudit(wakeAuditPath());
+  const baseConfig = { ...defaultWakeConfig(), enabled: true, allowCwds: [work], archiveMinIdleMs: 1, wakeTimeoutMs: 20_000, listTimeoutMs: 10_000 };
+  const self = { intercomId: "e2e-parent", piSessionId: "e2e-parent-pi", cwd: root };
+
+  // The catalog gives what the selection needs: the saved file and the last activity.
+  const sample = await answered();
+  const catalogEntry = ((await daemon("GET", `/sessions?${q}`)).json as any[]).find((e) => e.id === sample);
+  expect("S7: the catalog entry of a saved session has its file and last activity", typeof catalogEntry?.path === "string" && Number.isFinite(Date.parse(catalogEntry?.modified)), JSON.stringify(Object.keys(catalogEntry ?? {})));
+
+  // Batch: two saved sessions and one that never answered, asked with ONE confirmation.
+  const d = sample, e = await answered(), f = await newSession();
+  for (const sid of [d, e, f]) audit.append({ ts: Date.now() - 3_600_000, kind: "spawn", outcome: "delivered", code: "delivered", messageId: `seed-${sid}`, target: { piSessionId: sid, cwd: work }, sender: { piSessionId: self.piSessionId }, textLength: 1, textSha256: "x" });
+  let confirms = 0;
+  const many = await performArchiveMany({ config: baseConfig, provider, audit, confirm: async () => { confirms++; return true; }, self }, { ids: [d, e, f] });
+  const manyCodes = Object.fromEntries(many.results.map((r) => [r.piSessionId.slice(0, 8), r.code]));
+  note("S7 batch", "performArchiveMany", "result", JSON.stringify({ code: many.code, confirms, manyCodes }));
+  expect("S7: a batch asks once and archives the saved sessions, and skips the one that never answered", many.ok && confirms === 1 && (await archivedIds()).includes(d) && (await archivedIds()).includes(e) && !(await archivedIds()).includes(f) && many.results.find((r) => r.piSessionId === f)?.code === "not_saved");
+
+  // Automatic: two finished children and one that is still working; both keys present.
+  const a = await answered(), b = await answered(), c = await answered();
+  await prompt(c, "SLOW work");
+  await waitFor("streaming", async () => (await status(c)).isStreaming === true);
+  const attempts = new Map<string, number>();
+  const autoDeps = { config: { ...baseConfig, autoArchive: "trusted-children" as const }, provider, audit, self, archiveTrust: { find: () => ({ expiresAt: Date.now() + 60_000 }) }, attempts };
+  const round1 = await performAutoArchive(autoDeps, { candidates: [a, b, c].map((sid) => ({ piSessionId: sid, cwd: work })) });
+  note("S7 auto", "performAutoArchive", "round 1", JSON.stringify(round1.items.map((i) => [i.piSessionId.slice(0, 8), i.outcome])));
+  const afterRound1 = await archivedIds();
+  expect("S7: finished children are archived by themselves and the working one is left alone", afterRound1.includes(a) && afterRound1.includes(b) && !afterRound1.includes(c) && round1.items.find((i) => i.piSessionId === c)?.outcome === "busy");
+  await waitFor("turn finished", () => idle(c), 40_000);
+  await sleep(1500);
+  const finished = transcript(c).filter((x) => x.message?.role === "assistant").at(-1);
+  expect("S7: the working child's turn completed normally", finished?.message?.stopReason === "stop", String(finished?.message?.stopReason));
+  const round2 = await performAutoArchive(autoDeps, { candidates: [{ piSessionId: c, cwd: work }] });
+  expect("S7: once it is idle the next round archives it", round2.items[0]?.outcome === "archived" && (await archivedIds()).includes(c));
+  const autoAudit = audit.read().filter((x) => x.kind === "archive_auto" && x.outcome === "archived");
+  expect("S7: every automatic archive is audited with the parent's permission and no text", autoAudit.length === 3 && autoAudit.every((x) => x.confirmedBy === "archive-trust" && x.sender.piSessionId === self.piSessionId && x.textLength === 0));
+
+  // The two keys: without the global switch, or without the parent's own permission, nothing is archived.
+  const g = await answered();
+  const off = await performAutoArchive({ ...autoDeps, config: { ...baseConfig, autoArchive: "off" as const } }, { candidates: [{ piSessionId: g, cwd: work }] });
+  const untrusted = await performAutoArchive({ ...autoDeps, archiveTrust: { find: () => undefined } }, { candidates: [{ piSessionId: g, cwd: work }] });
+  expect("S7: with the global switch off, or without /archive-trust, nothing is archived", off.code === "auto_archive_off" && untrusted.code === "not_trusted" && !(await archivedIds()).includes(g));
 }
 
 writeFileSync(path.join(root, "busy-result.json"), JSON.stringify({ failures, findings }, null, 2));
